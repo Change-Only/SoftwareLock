@@ -1,0 +1,7 @@
+# 软件锁运行/打包所需依赖
+# 安装： pip install -r requirements.txt
+
+psutil>=5.9          # 进程枚举与挂起/恢复/结束
+Pillow>=10.0         # 图标绘制与 exe 图标提取后的处理
+pystray>=0.19        # 系统托盘
+pyinstaller>=6.0     # 打包为单文件 exe
