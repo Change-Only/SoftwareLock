@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -36,6 +37,24 @@ NAME_EN = "SoftwareLock"
 NAME_CN = "软件锁.exe"
 PORTABLE_NAME_EN = "SoftwareLockPortable"
 PORTABLE_DIR_CN = "软件锁便携版"
+
+
+def app_version() -> str:
+    """版本号唯一来源：src/config_store.APP_VERSION。"""
+    try:
+        sys.path.insert(0, str(SRC))
+        import config_store
+        return str(config_store.APP_VERSION)
+    except Exception as exc:
+        print(f"! 读取版本号失败，回退 0.0.0: {exc}")
+        return "0.0.0"
+
+
+VERSION = app_version()
+# 发布产物一律带版本号，避免「软件锁.exe」「软件锁.exe (1)」这种分不清版本的拷贝
+RELEASE_EXE_CN = f"软件锁-v{VERSION}.exe"
+RELEASE_DIR_CN = f"软件锁便携版-v{VERSION}"
+RELEASE_ZIP = f"软件锁便携版-v{VERSION}.zip"
 
 EXCLUDES = [
     "numpy", "pandas", "matplotlib", "scipy", "PyQt5", "PyQt6", "PySide2",
@@ -109,10 +128,19 @@ def make_icon() -> bool:
 def make_version_file() -> Path:
     path = BUILD / "version_info.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 版本号以 config_store.APP_VERSION 为唯一来源，避免两处不一致
+    try:
+        sys.path.insert(0, str(SRC))
+        import config_store
+        version = config_store.APP_VERSION
+    except Exception:
+        version = "1.4.3"
+    parts = (version.split(".") + ["0", "0", "0", "0"])[:4]
+    quad = ", ".join(str(int(p) if str(p).isdigit() else 0) for p in parts)
     path.write_text(
         "VSVersionInfo(\n"
         "  ffi=FixedFileInfo(\n"
-        "    filevers=(1, 4, 2, 0), prodvers=(1, 4, 2, 0),\n"
+        f"    filevers=({quad}), prodvers=({quad}),\n"
         "    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,\n"
         "    date=(0, 0)\n"
         "  ),\n"
@@ -121,12 +149,12 @@ def make_version_file() -> Path:
         "      StringTable('080404b0', [\n"
         "        StringStruct('CompanyName', 'SoftwareLock'),\n"
         "        StringStruct('FileDescription', '软件锁 - 应用启动密码保护'),\n"
-        "        StringStruct('FileVersion', '1.4.2.0'),\n"
+        f"        StringStruct('FileVersion', '{version}'),\n"
         "        StringStruct('InternalName', 'SoftwareLock'),\n"
         "        StringStruct('LegalCopyright', 'SoftwareLock'),\n"
         "        StringStruct('OriginalFilename', 'SoftwareLock.exe'),\n"
         "        StringStruct('ProductName', '软件锁'),\n"
-        "        StringStruct('ProductVersion', '1.4.2.0')\n"
+        f"        StringStruct('ProductVersion', '{version}')\n"
         "      ])\n"
         "    ]),\n"
         "    VarFileInfo([VarStruct('Translation', [2052, 1200])])\n"
@@ -134,6 +162,7 @@ def make_version_file() -> Path:
         ")\n",
         encoding="utf-8",
     )
+    print(f"√ 版本信息: {version} ({quad})")
     return path
 
 
@@ -212,7 +241,8 @@ def _build_onefile(icon_ok: bool, version_file: Path, binaries: list,
         return 1
 
     produced = DIST / f"{NAME_EN}.exe"
-    final = DIST / NAME_CN
+    final = DIST / RELEASE_EXE_CN
+    legacy = DIST / NAME_CN
     if produced.exists():
         try:
             _backup_path(final)
@@ -220,6 +250,13 @@ def _build_onefile(icon_ok: bool, version_file: Path, binaries: list,
         except Exception as exc:
             print(f"! 重命名失败（保留原名）: {exc}")
             final = produced
+    # 同步刷新一份不带版本号的名字，便于本地固定路径调用
+    try:
+        if final.exists() and final != legacy:
+            _backup_path(legacy)
+            shutil.copy2(final, legacy)
+    except Exception as exc:
+        print(f"! 生成无版本号副本失败: {exc}")
     if not final.exists():
         print("! 未找到单文件版产物")
         return 1
@@ -242,7 +279,7 @@ def _build_portable(icon_ok: bool, version_file: Path, binaries: list,
     if not produced_dir.is_dir():
         print("! 未找到便携版产物")
         return 1
-    final_dir = DIST / PORTABLE_DIR_CN
+    final_dir = DIST / RELEASE_DIR_CN
     if final_dir.exists():
         _backup_path(final_dir, "便携版")
     try:
@@ -261,6 +298,18 @@ def _build_portable(icon_ok: bool, version_file: Path, binaries: list,
         target = exe_in_dir
     total = sum(f.stat().st_size for f in final_dir.rglob("*") if f.is_file())
     print(f"√ 便携版: {target}  (整目录 {total / 1024 / 1024:.1f} MB)")
+
+    # 打包一份 zip，供 Release 直接分发（目录版解压即用，无需安装）
+    zip_path = DIST / RELEASE_ZIP
+    try:
+        _backup_path(zip_path, "便携版压缩包")
+        shutil.make_archive(str(DIST / f"软件锁便携版-v{VERSION}"), "zip",
+                            root_dir=str(final_dir.parent),
+                            base_dir=final_dir.name)
+        print(f"√ 便携版压缩包: {zip_path}  "
+              f"({zip_path.stat().st_size / 1024 / 1024:.1f} MB)")
+    except Exception as exc:
+        print(f"! 便携版压缩包生成失败: {exc}")
     return 0
 
 

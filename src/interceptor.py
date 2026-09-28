@@ -46,6 +46,7 @@ HANDOFF_MEMORY = 60.0
 # 放行会话内「完全没有任何可见窗口」持续超过该时长 -> 会话注销。
 # 没有窗口说明用户视角里应用已经关了（界面型应用窗口就是应用本身；
 # 本地服务 + 浏览器 UI 型应用进程本来就常驻无窗口，更不能给会话续命）。
+# 实际取值可被设置项 windowless_unlock_ttl 覆盖，这里只作兜底默认值。
 WINDOWLESS_TTL = 3.0
 # 会话里存在「新生儿」进程（存活不足该时长）时不做无窗口注销：
 # 应用刚放行时是被挂起状态，主窗口要等恢复后初始化完才出现（慢盘/杀软扫描时
@@ -137,6 +138,19 @@ class Interceptor:
         with self._lock:
             return config_store.norm_path(path) in self._unlocked
 
+    def is_running(self, path: str) -> bool:
+        """该受保护应用当前是否有进程在跑（用于界面「启动 / 关闭」按钮状态）。
+
+        优先看放行账本（几乎零开销），账本里没有时才做一次全量进程比对。
+        """
+        key = config_store.norm_path(path)
+        if not key:
+            return False
+        with self._lock:
+            if key in self._unlocked:
+                return True
+        return bool(self.running_pids(path))
+
     def forget(self, path: str) -> None:
         """把某个应用从「已放行」状态移除，下次启动重新要求密码。"""
         key = config_store.norm_path(path)
@@ -198,6 +212,7 @@ class Interceptor:
 
         # ---- 无窗口注销：会话内至少要有一个进程持有可见窗口 ----
         if survivors:
+            ttl = self._windowless_ttl()
             if now - self._last_window_check >= WINDOW_CHECK_INTERVAL:
                 self._last_window_check = now
                 try:
@@ -210,7 +225,7 @@ class Interceptor:
                     if any(pid in with_win for pid in pids):
                         self._last_window_seen[path] = now
             for path, pids in survivors.items():
-                if now - self._last_window_seen.get(path, 0.0) <= WINDOWLESS_TTL:
+                if now - self._last_window_seen.get(path, 0.0) <= ttl:
                     continue
                 # 存在「新生儿」进程：应用可能刚放行还没画出主窗口，暂不注销
                 if any(self._is_young(pid, now) for pid in pids):
@@ -228,6 +243,15 @@ class Interceptor:
         for path in list(self._ui_intent):
             if now > self._ui_intent[path] or path not in targets:
                 del self._ui_intent[path]
+
+    def _windowless_ttl(self) -> float:
+        """当前生效的「无可见窗口多久后注销放行」时长（秒）。"""
+        try:
+            value = float(self.store.settings.get("windowless_unlock_ttl",
+                                                  WINDOWLESS_TTL))
+        except Exception:
+            return WINDOWLESS_TTL
+        return max(0.5, value)
 
     def _is_young(self, pid: int, now: float) -> bool:
         """进程是否「新生儿」（刚放行不久，主窗口可能还没画出来）。"""
@@ -519,6 +543,12 @@ class Interceptor:
         with self._lock:
             if key not in self._unlocked:
                 self._ui_intent[key] = time.time() + UI_ADOPT_WINDOW
+        if remember and self.is_running(path):
+            # 已在运行：不再拉起新副本（会造成「双击两次开出两个窗口」），
+            # 直接把已有窗口带到前台交给用户。
+            self.focus_running(path)
+            config_store.log(f"界面启动 {app.get('name')}：已在运行，改为置前")
+            return True, "已在运行"
         workdir = os.path.dirname(path) or None
         try:
             proc = subprocess.Popen([path], cwd=workdir, close_fds=True)
@@ -537,6 +567,77 @@ class Interceptor:
     def lock_all_running(self) -> int:
         """结束所有正在运行的受保护应用，返回被结束的进程数。"""
         return self.close_all_protected()
+
+    def focus_running(self, path: str) -> bool:
+        """把该应用已有窗口带回前台（不拉起新进程）。"""
+        for pid in self.running_pids(path):
+            try:
+                winsys.force_foreground(pid)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def running_pids(self, path: str) -> list[int]:
+        """枚举某受保护应用当前正在运行的进程 pid（按 exe 路径全量比对）。
+
+        与 ``close_all_protected`` 同源：直接遍历全部进程按可执行文件路径命中，
+        不依赖扫描缓存，因此解锁状态下（甚至刚启动还没被扫描到）的实例也能找到。
+        """
+        target = config_store.norm_path(path)
+        if not target:
+            return []
+        base = os.path.basename(target)
+        if not base:
+            return []
+        result: list[int] = []
+        me = os.getpid()
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info.get("pid") or 0
+                if not pid or pid == me:
+                    continue
+                if (proc.info.get("name") or "").lower() != base:
+                    continue
+                exe = winsys.process_exe(pid)
+                if not exe or config_store.norm_path(exe) != target:
+                    continue
+                result.append(pid)
+            except Exception:
+                continue
+        return result
+
+    def close_one(self, app: dict) -> int:
+        """关闭单个受保护应用，返回被结束的进程数。
+
+        先把该路径从各类放行账本里清掉（否则实例还没死透时扫描线程可能把它
+        重新纳管），再结束整棵进程树。同时把「放行后残留的窗口句柄记录」清空，
+        避免这些 pid 复用时被误当成我们隐藏过的窗口。
+        """
+        path = app.get("path") or ""
+        key = config_store.norm_path(path)
+        pids = self.running_pids(path)
+        with self._lock:
+            bucket = self._unlocked.pop(key, None)
+            self._resigned.pop(key, None)
+            self._ui_intent.pop(key, None)
+            self._last_window_seen.pop(key, None)
+            self._pending.pop(key, None)
+            for pid in set(pids) | set(bucket or {}):
+                self._hidden.pop(pid, None)
+                self._pid_path.pop(pid, None)
+        total = 0
+        for pid in pids:
+            total += winsys.terminate_tree(pid)
+        total += sum(winsys.terminate_tree(pid) for pid in (bucket or {}))
+        if total:
+            self.store.bump_stat("blocked", 1)
+            self._emit(LockEvent(path, app.get("name") or "", pids[0] if pids else 0,
+                                 "blocked", f"结束 {total} 个进程"))
+        config_store.log(
+            f"关闭受保护应用 {app.get('name')}：结束 {total} 个进程 "
+            f"(pids={pids} 残留放行 pids={sorted(bucket or {})})")
+        return total
 
     def close_all_protected(self) -> int:
         """一键关闭全部受保护应用（按 exe 路径全量枚举，不依赖扫描缓存）。

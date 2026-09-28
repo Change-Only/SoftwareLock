@@ -25,6 +25,11 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE / "src"))
 
+# 隔离数据目录：必须在 import config_store 之前设置，否则 _writable_dir 会在
+# 项目根留下 .write_probe.tmp 探针文件。
+UI_DATA_DIR = Path(tempfile.mkdtemp(prefix="softlock-ui-data-"))
+os.environ["SOFTLOCK_DATA_DIR"] = str(UI_DATA_DIR)
+
 import tkinter as tk  # noqa: E402
 
 import config_store  # noqa: E402
@@ -90,6 +95,10 @@ class FakeInterceptor:
         self.events = []
         self.stop_called = False
         self._unlocked: set = set()
+        self._running: set = set()
+        self.closed: list = []
+        self.focused: list = []
+        self.launches: list = []
 
     def unlocked_paths(self):
         return set(self._unlocked)
@@ -97,10 +106,27 @@ class FakeInterceptor:
     def is_unlocked(self, path):
         return path in self._unlocked
 
+    def is_running(self, path):
+        return path in self._unlocked or path in self._running
+
+    def running_pids(self, path):
+        return [1234] if self.is_running(path) else []
+
+    def focus_running(self, path):
+        self.focused.append(path)
+        return True
+
+    def close_one(self, app):
+        self.closed.append(app.get("path"))
+        self._unlocked.discard(app.get("path"))
+        self._running.discard(app.get("path"))
+        return 1
+
     def forget(self, path):
         self._unlocked.discard(path)
 
     def launch(self, app):
+        self.launches.append(app.get("path"))
         return True, "stub"
 
     def lock_all_running(self):
@@ -167,7 +193,6 @@ def main() -> int:
     store = config_store.Store(tmp / "config.json")
     store.set_password("ui-test-123456")
     _make_apps(store)
-
     exe = Path(sys.executable)
 
     T.init_dpi_awareness()
@@ -303,6 +328,100 @@ def main() -> int:
             check("一键关闭全部走 close_all_protected", len(calls) == 1)
 
         guard("一键关闭全部应用", _check_lock_all)
+
+        # ---------------- 行内「启动 / 关闭」按运行状态切换 ----------------
+        print("\n[2.1.5] 行按钮随运行状态切换", flush=True)
+
+        def _row_action_text(win_obj, index):
+            """取第 index 行的操作按钮文字（启动/关闭/移除 中的第一个）。"""
+            row = win_obj._row_widgets[index]
+            from ui.widgets import RoundedButton
+            btns = [w for w in _walk(row) if isinstance(w, RoundedButton)]
+            return [b._label_text for b in btns]
+
+        def _check_row_buttons():
+            interceptor._unlocked.clear()
+            interceptor._running.clear()
+            win.refresh()
+            root.update()
+            texts = _row_action_text(win, 0)
+            check("未运行时行按钮为「启动」", "启动" in texts, f"{texts}")
+            check("未运行时出现「移除」", "移除" in texts, f"{texts}")
+
+            # 让第一个应用进入运行态
+            interceptor._unlocked.add(r"C:\x\one.exe")
+            win.refresh()
+            root.update()
+            texts = _row_action_text(win, 0)
+            check("运行时行按钮变「关闭」", "关闭" in texts, f"{texts}")
+            check("运行时不再显示「启动」", "启动" not in texts, f"{texts}")
+            interceptor._unlocked.clear()
+
+        guard("行按钮启动/关闭切换", _check_row_buttons)
+
+        def _check_close_one():
+            calls: list = []
+            interceptor._unlocked.add(r"C:\x\one.exe")
+            win.refresh()
+            root.update()
+            old = interceptor.close_one
+            interceptor.close_one = lambda a: (calls.append(a.get("path")), 1)[1]
+            try:
+                win.close_app(win.store.apps[0])
+                root.update()
+            finally:
+                interceptor.close_one = old
+            check("行「关闭」调用 close_one", calls == [r"C:\x\one.exe"], f"{calls}")
+            interceptor._unlocked.clear()
+            win.refresh()
+            root.update()
+
+        guard("行「关闭」走单应用关闭", _check_close_one)
+
+        def _check_double_click_no_new_window():
+            """双击：未运行 -> 调用 launch；已运行 -> 不拉起新进程。
+
+            注意：必须用**真实存在**的 exe 路径，否则 launch_app 会先弹
+            「文件不存在」的 messagebox —— 无头环境下模态框会永久阻塞整个自检。
+            """
+            interceptor.launches.clear()
+            interceptor._unlocked.clear()
+            old_apps = list(win.store.apps)
+            real = {"id": "real", "name": "真实文件", "path": str(exe), "enabled": True}
+            win.store.data["apps"] = [real]
+            win.refresh()
+            root.update()
+            try:
+                win.row_double_click(real)
+                root.update()
+                check("双击未运行应用 -> 触发 launch",
+                      interceptor.launches == [str(exe)], f"{interceptor.launches}")
+
+                interceptor.launches.clear()
+                interceptor._unlocked.add(str(exe))
+                win.refresh()
+                root.update()
+                win.row_double_click(real)
+                root.update()
+                check("双击已运行应用 -> 不再拉起新进程",
+                      interceptor.launches == [], f"{interceptor.launches}")
+            finally:
+                interceptor._unlocked.clear()
+                win.store.data["apps"] = old_apps
+                win.refresh()
+                root.update()
+
+        guard("双击不重复启动", _check_double_click_no_new_window)
+
+        def _check_toolbar_text():
+            from ui.widgets import RoundedButton
+            labels = [w._label_text for w in _walk(win.root) if isinstance(w, RoundedButton)]
+            check("工具条文案已改为「关闭全部应用」",
+                  "关闭全部应用" in labels, f"{labels[:8]}")
+            check("不再出现旧文案「一键关闭全部应用」",
+                  "一键关闭全部应用" not in labels)
+
+        guard("工具条文案", _check_toolbar_text)
 
         # ---------------- 退出鉴权（未通过密码） ----------------
         print("\n[2.2] 退出需密码：未通过时什么都不发生", flush=True)
@@ -440,6 +559,49 @@ def main() -> int:
         root.update()
 
     guard("设置面板：杀毒软件白名单入口", check_settings_exclusion)
+
+    def check_settings_new_options():
+        """新增设置：关窗后重新上锁（下拉）与「关闭后立即重新上锁」（勾选），
+        两者必须双向同步，且写回 store。"""
+        dlg = SettingsDialog(root, store, interceptor)
+        dlg._finish_init()
+        root.update()
+        texts = _widget_texts(dlg.shell)
+        check("设置面板出现「关窗后重新上锁」行",
+              any("关窗后重新上锁" in t for t in texts), str(texts[:10]))
+        check("设置面板出现「关闭后立即重新上锁」勾选",
+              any("重新上锁" in t for t in texts), "")
+
+        dlg.windowless.set("立即（0 秒）")
+        dlg._on_windowless()
+        check("下拉选立即 -> store=0.5s",
+              float(store.settings.get("windowless_unlock_ttl")) <= 0.5,
+              str(store.settings.get("windowless_unlock_ttl")))
+        check("下拉选立即 -> 勾选态自动打开", dlg.relock_var.get() is True)
+
+        dlg.windowless.set("10 秒")
+        dlg._on_windowless()
+        check("下拉选 10 秒 -> store=10",
+              float(store.settings.get("windowless_unlock_ttl")) == 10,
+              str(store.settings.get("windowless_unlock_ttl")))
+        check("下拉选 10 秒 -> 勾选态自动关闭", dlg.relock_var.get() is False)
+
+        dlg.relock_var.set(True)
+        dlg._on_relock()
+        check("勾选立即上锁 -> store<=0.5s",
+              float(store.settings.get("windowless_unlock_ttl")) <= 0.5)
+        check("勾选立即上锁 -> 下拉同步为「立即」",
+              dlg.windowless.get().startswith("立即"), dlg.windowless.get())
+
+        dlg.relock_var.set(False)
+        dlg._on_relock()
+        check("取消勾选 -> 回到 3 秒",
+              float(store.settings.get("windowless_unlock_ttl")) == 3,
+              str(store.settings.get("windowless_unlock_ttl")))
+        dlg._close()
+        root.update()
+
+    guard("设置面板：关窗后重新上锁双向同步", check_settings_new_options)
 
     # ---------------------------------------------------------------- [4] 密码框交互
     print("\n[4] 密码框：显示密码开关 / danger 标题", flush=True)

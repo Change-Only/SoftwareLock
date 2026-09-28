@@ -498,6 +498,8 @@ class SettingsDialog(BaseDialog):
         self.guard_var = tk.BooleanVar(value=bool(s.get("self_defense")))
         self.clean_var = tk.BooleanVar(value=bool(s.get("lock_running_on_start")))
         self.admin_var = tk.BooleanVar(value=bool(s.get("require_admin", True)))
+        self.relock_var = tk.BooleanVar(
+            value=float(s.get("windowless_unlock_ttl", 3) or 0) <= 0.5)
 
         CheckLine(body, "开机自动启动", self.auto_var, command=self._on_auto,
                   desc="（登录后自动在后台守护）").pack(anchor="w", pady=(0, 12))
@@ -509,7 +511,11 @@ class SettingsDialog(BaseDialog):
                   ).pack(anchor="w", pady=(0, 12))
         CheckLine(body, "启动时清理已运行的受保护应用", self.clean_var,
                   command=self._on_clean,
-                  desc="（避免先打开程序再开启软件锁）").pack(anchor="w", pady=(0, 18))
+                  desc="（避免先打开程序再开启软件锁）").pack(anchor="w", pady=(0, 12))
+        CheckLine(body, "关闭后立即重新上锁", self.relock_var,
+                  command=self._on_relock,
+                  desc="（应用关闭后立刻恢复需要密码，不等后台注销计时）"
+                  ).pack(anchor="w", pady=(0, 18))
 
         hline(body).pack(fill="x", pady=(0, 16))
 
@@ -545,24 +551,39 @@ class SettingsDialog(BaseDialog):
         combo2.bind("<<ComboboxSelected>>", self._on_cooldown)
 
         row3 = tk.Frame(body, bg=T.CARD)
-        row3.pack(fill="x", pady=(0, 16))
-        tk.Label(row3, text="密码", bg=T.CARD, fg=T.TEXT,
+        row3.pack(fill="x", pady=(0, 12))
+        tk.Label(row3, text="关窗后重新上锁", bg=T.CARD, fg=T.TEXT,
                  font=(T.fonts()["family"], 10)).pack(side="left")
-        RoundedButton(row3, "修改密码", command=self._change_pwd, kind="soft",
-                      width=100, height=32, bg=T.CARD).pack(side="right")
+        self.windowless = tk.StringVar(
+            value=self._ttl_label(s.get("windowless_unlock_ttl", 3))
+        )
+        combo3 = ttk.Combobox(
+            row3, textvariable=self.windowless, state="readonly", width=26,
+            values=["立即（0 秒）", "3 秒（推荐）", "10 秒", "30 秒", "1 分钟"],
+            font=(T.fonts()["family"], 9),
+        )
+        combo3.pack(side="right")
+        combo3.bind("<<ComboboxSelected>>", self._on_windowless)
 
         row4 = tk.Frame(body, bg=T.CARD)
-        row4.pack(fill="x", pady=(0, 8))
-        tk.Label(row4, text="数据目录", bg=T.CARD, fg=T.TEXT,
+        row4.pack(fill="x", pady=(0, 12))
+        tk.Label(row4, text="密码", bg=T.CARD, fg=T.TEXT,
                  font=(T.fonts()["family"], 10)).pack(side="left")
-        RoundedButton(row4, "打开", command=self._open_dir, kind="ghost",
-                      width=70, height=32, bg=T.CARD).pack(side="right")
+        RoundedButton(row4, "修改密码", command=self._change_pwd, kind="soft",
+                      width=100, height=32, bg=T.CARD).pack(side="right")
 
         row5 = tk.Frame(body, bg=T.CARD)
         row5.pack(fill="x", pady=(0, 8))
-        tk.Label(row5, text="杀毒软件误报", bg=T.CARD, fg=T.TEXT,
+        tk.Label(row5, text="数据目录", bg=T.CARD, fg=T.TEXT,
                  font=(T.fonts()["family"], 10)).pack(side="left")
-        RoundedButton(row5, "加入白名单", command=self._add_exclusion, kind="soft",
+        RoundedButton(row5, "打开", command=self._open_dir, kind="ghost",
+                      width=70, height=32, bg=T.CARD).pack(side="right")
+
+        row6 = tk.Frame(body, bg=T.CARD)
+        row6.pack(fill="x", pady=(0, 8))
+        tk.Label(row6, text="杀毒软件误报", bg=T.CARD, fg=T.TEXT,
+                 font=(T.fonts()["family"], 10)).pack(side="left")
+        RoundedButton(row6, "加入白名单", command=self._add_exclusion, kind="soft",
                       width=112, height=32, bg=T.CARD).pack(side="right")
 
         self.tip = tk.Label(
@@ -605,10 +626,50 @@ class SettingsDialog(BaseDialog):
     def _on_clean(self):
         self.store.update_settings(lock_running_on_start=bool(self.clean_var.get()))
 
+    def _on_relock(self):
+        """勾选 -> 关窗立即上锁（0.5s）；取消 -> 回到 3 秒宽限。"""
+        if bool(self.relock_var.get()):
+            sec = 0.5
+        else:
+            sec = 3
+        self.store.update_settings(windowless_unlock_ttl=sec)
+        self.windowless.set(self._ttl_label(sec))
+
     def _on_speed(self, _e=None):
         label = self.speed.get()
         ms = 60 if label.startswith("快速") else 300 if label.startswith("省电") else 120
         self.store.update_settings(poll_interval_ms=ms)
+
+    def _ttl_label(self, seconds) -> str:
+        try:
+            sec = float(seconds)
+        except Exception:
+            sec = 3.0
+        if sec <= 0.5:
+            return "立即（0 秒）"
+        if sec <= 5:
+            return "3 秒（推荐）"
+        if sec <= 20:
+            return "10 秒"
+        if sec <= 45:
+            return "30 秒"
+        return "1 分钟"
+
+    def _on_windowless(self, _e=None):
+        label = self.windowless.get()
+        if label.startswith("立即"):
+            sec = 0.5
+        elif label.startswith("10"):
+            sec = 10
+        elif label.startswith("30"):
+            sec = 30
+        elif label.startswith("1 "):
+            sec = 60
+        else:
+            sec = 3
+        self.store.update_settings(windowless_unlock_ttl=sec)
+        self.windowless.set(self._ttl_label(sec))
+        self.relock_var.set(sec <= 0.5)
 
     def _on_cooldown(self, _e=None):
         label = self.cooldown.get()

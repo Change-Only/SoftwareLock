@@ -18,6 +18,9 @@ from .widgets import LineEntry, Pill, RoundedButton, ScrollFrame, hline
 # 轻提示 Toast 的存活时长（毫秒）
 TOAST_MS = 2400
 
+# 事件驱动的列表刷新合并窗口（毫秒）：避免放行/关闭时高并发事件把刷新打爆
+REFRESH_COALESCE_MS = 350
+
 
 def _recolor(widget, color: str):
     """递归刷新控件背景色（列表行悬停高亮用）。"""
@@ -45,6 +48,7 @@ class MainWindow:
         self._authenticated = False
         self._search_text = ""
         self._toast = None
+        self._refresh_job = None
 
         self._build()
 
@@ -129,8 +133,8 @@ class MainWindow:
 
         RoundedButton(bar, "添加应用", icon="＋", command=self.add_app, kind="primary",
                       width=126, height=36, bg=T.BG).pack(side="left")
-        RoundedButton(bar, "一键关闭全部应用", command=self.lock_all, kind="ghost",
-                      width=166, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
+        RoundedButton(bar, "关闭全部应用", command=self.lock_all, kind="ghost",
+                      width=140, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
         RoundedButton(bar, "设置", command=self.open_settings, kind="ghost",
                       width=84, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
 
@@ -192,6 +196,19 @@ class MainWindow:
 
     def _on_search(self):
         self._search_text = (self.search.get() or "").strip()
+        self.refresh()
+
+    def refresh_later(self, delay: int = REFRESH_COALESCE_MS):
+        """把多次刷新请求合并成一次（放行/关闭会连续触发多条事件）。"""
+        if self._refresh_job is not None:
+            return
+        try:
+            self._refresh_job = self.root.after(delay, self._refresh_now)
+        except Exception:
+            self._refresh_job = None
+
+    def _refresh_now(self):
+        self._refresh_job = None
         self.refresh()
 
     def refresh(self):
@@ -288,8 +305,14 @@ class MainWindow:
         toggle.configure(cursor="hand2")
         toggle.bind("<Button-1>", lambda e, a=app: self.toggle_app(a))
 
-        RoundedButton(actions, "启动", command=lambda a=app: self.launch_app(a),
-                      kind="soft", width=76, height=32, bg=T.CARD).pack(side="left")
+        # 运行中 -> 「关闭」（结束进程、恢复保护）；未运行 -> 「启动」（免密放行）
+        if unlocked:
+            RoundedButton(actions, "关闭", command=lambda a=app: self.close_app(a),
+                          kind="danger", width=76, height=32,
+                          bg=T.CARD).pack(side="left")
+        else:
+            RoundedButton(actions, "启动", command=lambda a=app: self.launch_app(a),
+                          kind="soft", width=76, height=32, bg=T.CARD).pack(side="left")
         RoundedButton(actions, "移除", command=lambda a=app: self.remove_app(a),
                       kind="ghost", width=76, height=32, bg=T.CARD).pack(side="left", padx=(8, 0))
 
@@ -318,8 +341,8 @@ class MainWindow:
         for w in widgets:
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
-            # 双击启动 / 右键上下文菜单
-            w.bind("<Double-Button-1>", lambda e, a=app: self.launch_app(a))
+            # 双击：未运行 -> 启动；已在运行 -> 不重复拉起（把窗口带回前台）
+            w.bind("<Double-Button-1>", lambda e, a=app: self.row_double_click(a))
             w.bind("<Button-3>", lambda e, a=app: self._show_row_menu(e, a))
         return row
 
@@ -327,7 +350,11 @@ class MainWindow:
         menu = tk.Menu(self.root, tearoff=0, bg=T.CARD, fg=T.TEXT,
                        activebackground=T.PRIMARY_SOFT, activeforeground=T.PRIMARY,
                        bd=0, relief="flat")
-        menu.add_command(label="启动", command=lambda a=app: self.launch_app(a))
+        running = bool(self.interceptor and self.interceptor.is_unlocked(app.get("path", "")))
+        if running:
+            menu.add_command(label="关闭", command=lambda a=app: self.close_app(a))
+        else:
+            menu.add_command(label="启动", command=lambda a=app: self.launch_app(a))
         menu.add_command(label="打开所在文件夹",
                          command=lambda a=app: self._open_folder(a))
         menu.add_separator()
@@ -453,12 +480,19 @@ class MainWindow:
         self.refresh()
 
     def launch_app(self, app: dict):
-        """界面内启动：免密码，直接放行。"""
+        """界面内启动：免密码，直接放行。已在运行时不重复拉起。"""
         name = app.get("name") or "该程序"
         path = app.get("path", "")
         if not os.path.isfile(path):
             messagebox.showerror("无法启动", "文件不存在或已被移动，请重新添加。",
                                  parent=self.root)
+            return
+        if self._is_running(app):
+            # 双击已运行的行不应该再开一个窗口，只把它带回前台
+            self.push_event_text(f"{name} 已在运行")
+            self.toast(f"{name} 已在运行", kind="info")
+            self._focus_running(path)
+            self.refresh()
             return
         ok, message = self.interceptor.launch(app)
         self.push_event_text(("已启动 " if ok else "启动失败 ") + name)
@@ -467,6 +501,48 @@ class MainWindow:
         else:
             messagebox.showerror("启动失败", message, parent=self.root)
         self.root.after(1200, self.refresh)
+
+    def close_app(self, app: dict):
+        """关闭单个受保护应用：结束它的全部进程并恢复保护。"""
+        name = app.get("name") or "该程序"
+        try:
+            total = self.interceptor.close_one(app)
+        except AttributeError:  # 兼容旧版注入桩
+            self.interceptor.forget(app.get("path", ""))
+            total = 0
+        if total:
+            self.toast(f"已关闭 {name}（结束 {total} 个进程）", kind="success")
+            self.push_event_text(f"已关闭 {name}")
+        else:
+            self.toast(f"{name} 已不在运行", kind="info")
+        self.refresh_later(0)
+
+    def _focus_running(self, path: str):
+        """让该应用的已有窗口回到前台（方法不存在时静默跳过）。"""
+        if not self.interceptor:
+            return
+        try:
+            self.interceptor.focus_running(path)
+        except AttributeError:
+            pass
+
+    def _is_running(self, app: dict) -> bool:
+        """应用当前是否在运行：放行账本优先，账本没有时回落到进程枚举。"""
+        if not self.interceptor:
+            return False
+        path = app.get("path", "")
+        try:
+            return bool(self.interceptor.is_running(path))
+        except AttributeError:  # 旧版注入桩只提供 is_unlocked
+            try:
+                return bool(self.interceptor.unlocked_paths()
+                            and self.interceptor.is_unlocked(path))
+            except Exception:
+                return False
+
+    def row_double_click(self, app: dict):
+        """双击整行：未运行则启动；已在运行时只把窗口带回前台，不新开一个。"""
+        self.launch_app(app)
 
     def lock_all(self):
         """一键关闭全部受保护应用（按 exe 路径全量枚举）。"""
@@ -639,4 +715,4 @@ class MainWindow:
                 self.tray.notify(f"已阻止「{name}」启动：未通过密码验证")
         elif action == "allowed":
             self.push_event_text(f"已放行 {name}")
-        self.refresh()
+        self.refresh_later()

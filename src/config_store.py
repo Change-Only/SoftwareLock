@@ -21,7 +21,7 @@ from pathlib import Path
 
 APP_NAME = "SoftwareLock"
 APP_DISPLAY_NAME = "软件锁"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 # 旧版数据目录（升级迁移用）
 LEGACY_APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
@@ -97,6 +97,9 @@ DEFAULT_SETTINGS = {
     "cooldown_seconds": 30,           # 冷却时长
     "prompt_timeout_seconds": 300,    # 密码窗口最长等待，超时按拒绝处理
     "require_admin": True,            # 启动时尝试以管理员身份运行（拦截管理员程序所必需）
+    # 放行会话在「没有任何可见窗口」多久后自动注销（秒）。调大可容忍
+    # 「关窗后仍留后台进程」的软件，调小则关窗即重新上锁。
+    "windowless_unlock_ttl": 3,
 }
 
 _lock = threading.RLock()

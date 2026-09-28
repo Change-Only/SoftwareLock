@@ -63,14 +63,30 @@ def main() -> int:
     from ui.main_window import MainWindow
 
     class FakeInterceptor:
+        def __init__(self):
+            self._running = set()
+
         def unlocked_paths(self):
-            return set()
+            return set(self._running)
 
         def is_unlocked(self, path):
-            return False
+            return path in self._running
+
+        def is_running(self, path):
+            return path in self._running
+
+        def running_pids(self, path):
+            return [1] if path in self._running else []
+
+        def focus_running(self, path):
+            return True
+
+        def close_one(self, app):
+            self._running.discard(app.get("path"))
+            return 1
 
         def forget(self, path):
-            pass
+            self._running.discard(path)
 
         def launch(self, app):
             return True, "stub"
@@ -88,6 +104,16 @@ def main() -> int:
     root.update()
 
     grab(root, "01-main")
+
+    # 运行中：该行出现「运行中」标签，按钮切成「关闭」
+    if store.apps:
+        interceptor._running.add(store.apps[0]["path"])
+        win.refresh()
+        root.update()
+        grab(root, "10-main-running")
+        interceptor._running.clear()
+        win.refresh()
+        root.update()
 
     # 空态（含「添加第一个应用」主按钮）
     saved_apps = list(store.apps)
