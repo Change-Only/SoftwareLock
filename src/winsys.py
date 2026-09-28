@@ -630,6 +630,57 @@ def run_powershell(script: str, timeout: int = 60) -> tuple[int, str]:
     return proc.returncode, _decode_console(raw).strip()
 
 
+def spawn_detached_tree_safe(args: list[str], workdir: str | None = None) -> int | None:
+    """拉起一个与当前进程**树**脱钩的进程，返回新进程 pid（失败返回 None）。
+
+    任务管理器的「结束进程树」按父子关系连坐结束进程。软件锁是双进程互为看守，
+    如果看守进程是主进程的直接子进程，一次「结束进程树」就能把两个一起带走，
+    保护随之消失（这是实际发生过的漏洞）。这里经 WMI ``Win32_Process.Create``
+    拉起进程，新进程的父进程是 WMI 提供程序（WmiPrvSE），不在软件锁的进程树里，
+    树杀只会带走被结束的那棵子树。
+
+    优先走 WMI（经 PowerShell 调用）；WMI 不可用时回退为普通分离式启动
+    （防杀能力降一档，但看守功能不受影响）。
+
+    注意：经 WMI 拉起的进程**不继承当前进程的环境变量**，也不继承工作目录
+    （可显式传 ``workdir``）；依赖 exe 自身路径定位数据的进程（如软件锁）不受影响。
+    """
+    import subprocess
+
+    cmdline = subprocess.list2cmdline(args)
+    ps_arg = cmdline.replace("'", "''")
+    extra = ""
+    if workdir:
+        extra = f";CurrentDirectory='{workdir.replace(chr(39), chr(39) * 2)}'"
+    script = (
+        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        f"-Arguments @{{CommandLine='{ps_arg}'{extra}}}; "
+        "Write-Output (\"{0}`t{1}\" -f $r.ReturnValue, $r.ProcessId)"
+    )
+    code, out = run_powershell(script, timeout=30)
+    if code == 0 and out:
+        try:
+            first = out.splitlines()[0].strip()
+            parts = first.replace(" ", "\t").split("\t")
+            parts = [p for p in parts if p]
+            if len(parts) >= 2 and parts[0] == "0" and parts[1].isdigit():
+                return int(parts[1])
+        except Exception:
+            pass
+    _log(f"WMI 脱树拉起失败（code={code} out={out[:120]!r}），回退普通分离式启动: "
+         f"{cmdline[:160]}", "WARNING")
+    # 回退：普通分离式启动（父进程仍是当前进程，可被「结束进程树」连坐）
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    try:
+        return subprocess.Popen(args, close_fds=True, creationflags=flags,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).pid
+    except Exception as exc:
+        _log(f"分离式启动也失败: {exc}", "ERROR")
+        return None
+
+
 def _enum_hklm_values(path: str) -> list[str] | None:
     """枚举 HKLM 下某个键的所有值名；无权限或键不存在时返回 None。"""
     if not IS_WIN:

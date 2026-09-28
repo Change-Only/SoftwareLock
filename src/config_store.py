@@ -21,7 +21,7 @@ from pathlib import Path
 
 APP_NAME = "SoftwareLock"
 APP_DISPLAY_NAME = "软件锁"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 # 旧版数据目录（升级迁移用）
 LEGACY_APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME

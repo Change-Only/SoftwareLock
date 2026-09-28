@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 import traceback
 
@@ -25,6 +24,10 @@ from config_store import Store  # noqa: E402
 
 MAX_GUARD_RESTARTS = 30
 GUARD_HEALTHY_RESET_MS = 20_000
+# 看守进程轮询间隔：主进程被结束后最多这么久就会被重新拉起
+WATCHDOG_POLL = 0.4
+# 拉起重启实例后，等待它完成接管的时间（0.5s × 步数）
+TAKEOVER_WAIT_STEPS = 24
 
 
 # ---------------------------------------------------------------------------
@@ -51,37 +54,34 @@ def _write_guard_fail(value: int) -> None:
         pass
 
 
-def _spawn_detached(args: list[str]) -> int | None:
-    try:
-        flags = 0
-        flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        proc = subprocess.Popen(args, close_fds=True, creationflags=flags,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-        return proc.pid
-    except Exception as exc:
-        config_store.log(f"拉起子进程失败: {exc}", "ERROR")
-        return None
-
-
 def run_watchdog(parent_pid: int) -> int:
-    """看守模式：主进程非正常退出时把它拉起来。"""
+    """看守模式：主进程被任务管理器结束后把它拉起来。
+
+    关键语义（1.4.2 修复）：
+      * 看守进程由 ``spawn_detached_tree_safe`` 拉起，父进程不在软件锁的进程树里，
+        「结束进程树」连坐不到它 —— 这是树杀漏洞的堵点；
+      * 拉起重启实例后**等待接管成功**才算完成使命；重启实例闪退 / UAC 未批准时
+        继续循环再拉（受 MAX_GUARD_RESTARTS 限制），不会一次失败就弃守；
+      * 非提权环境下重启实例带 ``--no-elevate``：无人值守的重启路径上不再弹 UAC，
+        静默以普通权限恢复保护（界面显示橙色警告条），好过保护直接死亡。
+    """
     import time
 
     import psutil
 
     config_store.log(f"看守进程启动，监视 PID {parent_pid}")
     while True:
-        time.sleep(0.8)
+        time.sleep(WATCHDOG_POLL)
         try:
             if config_store.EXIT_FLAG.exists():
-                break
-            if psutil.pid_exists(parent_pid):
+                config_store.log("看守进程退出（收到退出标记）")
+                return 0
+            if parent_pid and psutil.pid_exists(parent_pid):
                 continue
-            # 主进程没了：若已有新实例在跑，说明是正常交接，无需干预
+            # 主进程没了：若已有实例接管（重启交接 / 用户手动启动），使命完成
             if winsys.instance_running():
-                break
+                config_store.log("看守进程退出（检测到已有实例接管）")
+                return 0
             count = _read_guard_fail() + 1
             if count > MAX_GUARD_RESTARTS:
                 config_store.log("看守进程：短时间重启次数过多，放弃拉起", "ERROR")
@@ -90,20 +90,34 @@ def run_watchdog(parent_pid: int) -> int:
             config_store.log(f"检测到主进程终止，第 {count} 次自动重启")
             restart_args = ["--minimized"]
             if winsys.is_elevated():
-                # 已在管理员权限下运行，带上 --elevated 避免重启时再弹 UAC
+                # 看守继承主进程的管理员令牌：静默提权重启，无需再过 UAC
                 restart_args.append("--elevated")
-            _spawn_detached(_child_command(*restart_args))
-            break
+            else:
+                restart_args.append("--no-elevate")
+            winsys.spawn_detached_tree_safe(_child_command(*restart_args))
+            # 等新实例接管；没接管成功就继续循环再拉
+            taken_over = False
+            for _ in range(TAKEOVER_WAIT_STEPS):
+                time.sleep(0.5)
+                if config_store.EXIT_FLAG.exists() or winsys.instance_running():
+                    taken_over = True
+                    break
+            if taken_over:
+                config_store.log("看守进程退出（重启实例已接管）")
+                return 0
+            config_store.log("重启实例未完成接管，继续尝试拉起", "WARNING")
+            parent_pid = 0  # 原 pid 确认已死，后续只按 instance_running 判断
         except Exception as exc:
             config_store.log(f"看守进程异常: {exc}", "ERROR")
-    config_store.log("看守进程退出")
+    config_store.log("看守进程退出（重启次数过多，放弃拉起）")
     return 0
 
 
 def spawn_watchdog(parent_pid: int) -> int | None:
     args = _child_command("--watchdog", str(parent_pid))
     config_store.log(f"启动看守进程: {' '.join(args)}")
-    return _spawn_detached(args)
+    # 必须经 WMI 脱树拉起：否则「结束进程树」会把看守连同主进程一起带走
+    return winsys.spawn_detached_tree_safe(args)
 
 
 # ---------------------------------------------------------------------------
@@ -265,30 +279,43 @@ def main() -> int:
             args.minimized = True
 
     if not args.no_guard and store.settings.get("self_defense", True):
-        guard_pid = spawn_watchdog(os.getpid())
+        import threading
+        import time as _time
+
+        import psutil
+
+        # 看守的拉起要经 WMI（PowerShell 一来一回可能要数秒），绝不能阻塞主线程：
+        # 放后台线程里做，主循环照常运转；拉起结果放进 holder 供反向守护读取。
+        guard_holder = {"pid": None}
+
+        def _spawn_guard():
+            guard_holder["pid"] = spawn_watchdog(os.getpid())
+
+        threading.Thread(target=_spawn_guard, name="guard-spawner",
+                         daemon=True).start()
         root.after(GUARD_HEALTHY_RESET_MS, lambda: _write_guard_fail(0))
 
         # 反向守护：看守进程被任务管理器结束掉时，主进程立刻再拉一个，
         # 两个进程互为看守，单独杀掉任何一个都会被另一个立即恢复。
-        if guard_pid:
-            import threading
-            import time as _time
+        def _watch_guard():
+            while not quitting["done"]:
+                _time.sleep(0.6)
+                try:
+                    pid = guard_holder.get("pid")
+                    if pid and not psutil.pid_exists(pid):
+                        config_store.log("看守进程被终止，重新拉起")
+                        new_pid = spawn_watchdog(os.getpid())
+                        if new_pid:
+                            guard_holder["pid"] = new_pid
+                        else:
+                            # 拉起失败（WMI/PowerShell 均不可用）：退避后再试，
+                            # 避免每 0.6 秒连环重试
+                            _time.sleep(3.0)
+                except Exception as exc:
+                    config_store.log(f"反向守护异常: {exc}", "ERROR")
 
-            import psutil
-
-            def _watch_guard():
-                nonlocal guard_pid
-                while not quitting["done"]:
-                    _time.sleep(1.0)
-                    try:
-                        if guard_pid and not psutil.pid_exists(guard_pid):
-                            config_store.log("看守进程被终止，重新拉起")
-                            guard_pid = spawn_watchdog(os.getpid()) or None
-                    except Exception as exc:
-                        config_store.log(f"反向守护异常: {exc}", "ERROR")
-
-            threading.Thread(target=_watch_guard, name="guard-watcher",
-                             daemon=True).start()
+        threading.Thread(target=_watch_guard, name="guard-watcher",
+                         daemon=True).start()
 
     def _watch_show_flag():
         try:
