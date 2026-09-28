@@ -19,3 +19,6 @@ logs/
 # 系统杂项
 Thumbs.db
 .DS_Store
+
+# config_store 写探针临时文件
+.write_probe.tmp
