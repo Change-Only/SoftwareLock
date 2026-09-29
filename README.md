@@ -287,6 +287,12 @@ python tools/smoketest_exe.py           # 打包产物端到端冒烟
 > `smoketest_exe.py` 通过 `SOFTLOCK_DATA_DIR` 环境变量把被测 exe 的数据目录隔离到临时目录，
 > 绝不写 `dist/config.json` —— 否则用户升级新版时会被判定为「已有配置」而跳过旧数据迁移。
 
+**界面自适应缩放**：界面按 1920×1080 逻辑桌面设计，运行时按
+`系统缩放 × min(1, 逻辑宽/1920, 逻辑高/1080)` 自动计算缩放系数（下限 0.85），
+所以 4K@200% 与 1080p@100%/125%/150% 上的窗口占比与字号观感一致。
+做视觉回归时可用 `SOFTLOCK_UI_DPI` / `SOFTLOCK_UI_SCREEN=1920x1080`
+两个环境变量在一台机器上复现另一台机器的渲染结果（配合 `tools/uishot.py` 截图）。
+
 ### 打包
 
 ```bash
@@ -344,7 +350,7 @@ python build.py --no-sign     # 跳过代码签名
 │  ├─ artwork.py         图标绘制与首字头像
 │  └─ ui/
 │     ├─ __init__.py     包初始化
-│     ├─ theme.py        配色、字体、DPI 缩放
+│     ├─ theme.py        配色、字体、自适应 DPI 缩放（按分辨率 + 系统缩放自动适配）
 │     ├─ widgets.py      圆角按钮、状态标签、勾选框、滚动容器、输入框
 │     ├─ dialogs.py      密码框、设置、初始化、通用确认
 │     ├─ broker.py       跨线程鉴权调度（后台线程请求 → 主线程弹窗）

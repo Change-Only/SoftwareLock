@@ -26,6 +26,11 @@ def grab(widget, name: str, init: bool = True):
 
     if init and hasattr(widget, "_finish_init"):
         widget._finish_init()
+    # 抓屏期间置顶，避免用户正在操作的其他窗口盖进截图里
+    try:
+        widget.attributes("-topmost", True)
+    except Exception:
+        pass
     widget.update_idletasks()
     widget.update()
     time.sleep(0.8)

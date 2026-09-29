@@ -224,14 +224,17 @@ class LineEntry(tk.Frame):
             relief="flat", bd=0, highlightthickness=0, bg=bg, fg=T.TEXT,
             insertbackground=T.PRIMARY, width=1,
         )
-        self.entry.pack(fill="both", expand=True, padx=10, pady=8)
+        # padx/pady 必须走 T.px 缩放：字体点数已随 DPI 放大，若内边距仍是
+        # 固定像素，高 DPI 下输入框会被文字挤满、矮一截（与按钮 36px 不齐）。
+        pad_x, pad_y = T.px(10), T.px(8)
+        self.entry.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
         # 关闭几何传播：宽度/高度由本控件显式决定，否则 1 字符的 Entry 会把
         # Frame 压缩到极窄（工具条里的搜索框就会显示不全）。
         try:
-            natural_h = self.entry.winfo_reqheight() + 16  # entry 上下 pady 各 8
+            natural_h = self.entry.winfo_reqheight() + 2 * pad_y
         except Exception:
             natural_h = 0
-        self.configure(width=width, height=max(natural_h, T.px(34)))
+        self.configure(width=T.px(width), height=max(natural_h, T.px(34)))
         self.pack_propagate(False)
         self.entry.bind("<FocusIn>", self._on_focus_in)
         self.entry.bind("<FocusOut>", self._on_focus_out)
@@ -256,7 +259,7 @@ class LineEntry(tk.Frame):
         if self.var.get() or focused:
             self._ph.place_forget()
         else:
-            self._ph.place(x=10, y=0, relheight=1.0)
+            self._ph.place(x=T.px(10), y=0, relheight=1.0)
 
     def _on_focus_in(self, _e):
         try:
@@ -438,4 +441,5 @@ class CheckLine(tk.Frame):
 
 
 def hline(parent, color=T.BORDER, bg=None):
-    return tk.Frame(parent, bg=color, height=1)
+    # 高度随 DPI 缩放：4K@200% 下仍是设计稿里的 1px 观感（物理 2px）
+    return tk.Frame(parent, bg=color, height=max(1, T.px(1)))

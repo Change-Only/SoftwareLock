@@ -56,10 +56,13 @@ class MainWindow:
     def _build(self):
         root = self.root
         root.title("软件锁")
-        root.minsize(T.px(720), T.px(520))
-        # 首次显示时居中到屏幕
+        # 首次显示时居中到屏幕；窗口不超过屏幕可用区域（保险丝：
+        # 极小分辨率 + 高缩放的自适应系数触底后仍可能偏大）
         win_w, win_h = T.px(780), T.px(600)
         scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        win_w = min(win_w, max(T.px(560), int(scr_w * 0.94)))
+        win_h = min(win_h, max(T.px(460), int(scr_h * 0.9)))
+        root.minsize(min(T.px(720), win_w), min(T.px(520), win_h))
         pos_x = max(0, (scr_w - win_w) // 2)
         pos_y = max(0, (scr_h - win_h) // 3)
         root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
