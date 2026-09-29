@@ -135,6 +135,8 @@ class MainWindow:
                       width=126, height=36, bg=T.BG).pack(side="left")
         RoundedButton(bar, "关闭全部应用", command=self.lock_all, kind="ghost",
                       width=140, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
+        RoundedButton(bar, "刷新状态", command=self.check_status, kind="ghost",
+                      width=100, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
         RoundedButton(bar, "设置", command=self.open_settings, kind="ghost",
                       width=84, height=36, bg=T.BG).pack(side="left", padx=(10, 0))
 
@@ -168,7 +170,7 @@ class MainWindow:
     def _bind_shortcuts(self):
         self.root.bind("<Control-a>", self._on_add_shortcut)
         self.root.bind("<Control-A>", self._on_add_shortcut)
-        self.root.bind("<F5>", lambda e: (self.refresh(), "break")[1])
+        self.root.bind("<F5>", lambda e: (self.check_status(), "break")[1])
         self.root.bind("<Escape>", self._on_escape)
 
     def _on_add_shortcut(self, _e=None):
@@ -211,23 +213,64 @@ class MainWindow:
         self._refresh_job = None
         self.refresh()
 
-    def refresh(self):
+    def _running_paths_now(self) -> set:
+        """当前「正在运行」的受保护应用路径集合（已归一化）。
+
+        账本命中零开销；账本没命中的才做一次**批量**进程枚举兜底，所以即使
+        放行账本已被引擎注销，界面也能立刻反映真实进程状态。只统计启用状态
+        的应用，与行按钮（启动 / 关闭）的语义保持一致。
+        """
+        if not self.interceptor:
+            return set()
+        keys: dict[str, str] = {}
+        for app in self.store.apps:
+            if not app.get("enabled", True):
+                continue
+            key = config_store.norm_path(app.get("path", ""))
+            if key:
+                keys[key] = app.get("path", "")
+        if not keys:
+            return set()
+        try:
+            unlocked = self.interceptor.unlocked_paths()
+        except Exception:
+            unlocked = set()
+        running = {k for k in keys if k in unlocked}
+        pending = [keys[k] for k in keys if k not in unlocked]
+        if pending:
+            try:
+                found = self.interceptor.running_map(pending)
+            except AttributeError:      # 旧版注入桩
+                found = {}
+                for p in pending:
+                    try:
+                        if self.interceptor.is_running(p):
+                            found[config_store.norm_path(p)] = [1]
+                    except Exception:
+                        continue
+            running |= {k for k, pids in found.items() if pids}
+        return running
+
+    def refresh(self, running_paths=None):
         if not self.root.winfo_exists():
             return
         self.scroll.clear()
         self._row_widgets = []
+        if running_paths is None:
+            running_paths = self._running_paths_now()
         apps = self._filtered_apps()
         if not apps:
             self._build_empty_state(has_filter=bool(self._search_text))
         else:
             total = len(apps)
             for index, app in enumerate(apps):
-                self._row_widgets.append(self._build_row(app, index, total))
+                key = config_store.norm_path(app.get("path", ""))
+                self._row_widgets.append(
+                    self._build_row(app, index, total, running=key in running_paths))
 
         stats = self.store.stats()
         protected = len(self.store.enabled_apps())
-        unlocked = self.interceptor.unlocked_paths() if self.interceptor else set()
-        running = len(unlocked)
+        running = len(running_paths)
         self.stats_label.configure(
             text=f"已保护 {protected} 个应用 · 已拦截启动 {stats.get('blocked', 0)} 次 "
                  f"· 已放行 {stats.get('allowed', 0)} 次 · 运行中 {running}"
@@ -244,6 +287,71 @@ class MainWindow:
             self.tray.set_title(
                 f"软件锁 · 已保护 {protected} 个应用 · 运行中 {running}"
             )
+
+    # ------------------------------------------------------- 手动状态检查
+    def check_status(self):
+        """重新检查全部已添加应用的运行状态，并刷新列表（工具条「刷新状态」/ F5）。
+
+        比平时的自动刷新多做两件事：
+        1. 不做「账本优先」短路，直接按 exe 路径全量枚举一遍，拿到权威结果；
+        2. 顺手清理「进程已经全部退出、放行账本却还留着」的残留会话——
+           否则这些应用会一直被界面显示成运行中。
+        """
+        apps = list(self.store.apps)
+        paths = [a.get("path", "") for a in apps if a.get("path")]
+        running: set = set()
+        if self.interceptor and paths:
+            try:
+                found = self.interceptor.running_map(paths)
+            except AttributeError:      # 旧版注入桩
+                found = {}
+                for p in paths:
+                    try:
+                        if self.interceptor.is_running(p):
+                            found[config_store.norm_path(p)] = [1]
+                    except Exception:
+                        continue
+            running = {k for k, pids in found.items() if pids}
+
+            try:
+                leftover = self.interceptor.unlocked_paths()
+            except Exception:
+                leftover = set()
+            stale = 0
+            for key in leftover:
+                if key in running:
+                    continue
+                try:
+                    if self.interceptor.startup_pending(key):
+                        continue        # 刚点过「启动」，进程可能还在创建中
+                except AttributeError:
+                    pass
+                try:
+                    self.interceptor.forget(key)
+                    stale += 1
+                except Exception:
+                    continue
+            if stale:
+                config_store.log(f"状态检查：清理 {stale} 条已退出的放行残留")
+
+        self.refresh(running_paths=running)
+
+        enabled_keys = set()
+        for app in apps:
+            if app.get("enabled", True):
+                key = config_store.norm_path(app.get("path", ""))
+                if key:
+                    enabled_keys.add(key)
+        running_now = len(running & enabled_keys)
+        total = len(apps)
+        if not total:
+            self.toast("还没有添加任何应用", kind="info")
+        elif running_now:
+            self.toast(f"状态已更新 · {running_now} 个应用正在运行", kind="info")
+        else:
+            self.toast(f"状态已更新 · {total} 个应用均未运行", kind="info")
+        self.push_event_text(f"已检查应用状态（运行中 {running_now} / 共 {total}）")
+        return running_now
 
     def _build_empty_state(self, has_filter: bool = False):
         box = tk.Frame(self.scroll.body, bg=T.CARD)
@@ -266,7 +374,7 @@ class MainWindow:
                       kind="primary", width=168, height=40,
                       bg=T.CARD).pack(pady=(18, 0))
 
-    def _build_row(self, app: dict, index: int, total: int):
+    def _build_row(self, app: dict, index: int, total: int, running: bool = False):
         row = tk.Frame(self.scroll.body, bg=T.CARD)
         row.pack(fill="x")
         inner = tk.Frame(row, bg=T.CARD)
@@ -284,7 +392,7 @@ class MainWindow:
         name_row.pack(fill="x", anchor="w")
         tk.Label(name_row, text=app.get("name") or "未命名", bg=T.CARD, fg=T.TEXT,
                  font=(T.fonts()["family"], 10, "bold")).pack(side="left")
-        unlocked = bool(self.interceptor and self.interceptor.is_unlocked(app.get("path", "")))
+        unlocked = bool(running)
         if unlocked:
             Pill(name_row, "运行中", fg=T.WARN, bg=T.WARN_SOFT, width=58, height=20,
                  parent_bg=T.CARD).pack(side="left", padx=(8, 0))
@@ -303,7 +411,15 @@ class MainWindow:
                       width=66, height=26, parent_bg=T.CARD)
         toggle.pack(side="left", padx=(0, 10))
         toggle.configure(cursor="hand2")
-        toggle.bind("<Button-1>", lambda e, a=app: self.toggle_app(a))
+        def _on_toggle_click(_e=None, a=app):
+            """点击「已启用 / 已停用」标签切换该应用的保护开关。
+
+            允许无 event 调用（tk 在少数合成/销毁路径下会 0 参回调），
+            否则会抛 TypeError 让这次切换静默失败。
+            """
+            self.toggle_app(a)
+
+        toggle.bind("<Button-1>", _on_toggle_click)
 
         # 运行中 -> 「关闭」（结束进程、恢复保护）；未运行 -> 「启动」（免密放行）
         if unlocked:
@@ -342,7 +458,7 @@ class MainWindow:
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
             # 双击：未运行 -> 启动；已在运行 -> 不重复拉起（把窗口带回前台）
-            w.bind("<Double-Button-1>", lambda e, a=app: self.row_double_click(a))
+            w.bind("<Double-Button-1>", lambda _e=None, a=app: self.row_double_click(a))
             w.bind("<Button-3>", lambda e, a=app: self._show_row_menu(e, a))
         return row
 
@@ -350,7 +466,7 @@ class MainWindow:
         menu = tk.Menu(self.root, tearoff=0, bg=T.CARD, fg=T.TEXT,
                        activebackground=T.PRIMARY_SOFT, activeforeground=T.PRIMARY,
                        bd=0, relief="flat")
-        running = bool(self.interceptor and self.interceptor.is_unlocked(app.get("path", "")))
+        running = self._is_running(app)
         if running:
             menu.add_command(label="关闭", command=lambda a=app: self.close_app(a))
         else:

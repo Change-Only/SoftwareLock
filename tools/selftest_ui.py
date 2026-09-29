@@ -96,21 +96,45 @@ class FakeInterceptor:
         self.stop_called = False
         self._unlocked: set = set()
         self._running: set = set()
+        self._pending: set = set()      # 模拟「刚点过启动」的免密握手窗口
         self.closed: list = []
         self.focused: list = []
         self.launches: list = []
+
+    # 引擎里的路径账本一律是归一化的，桩也照做，避免大小写带来假阴性
+    @staticmethod
+    def _key(path):
+        return config_store.norm_path(path)
+
+    def mark_running(self, path):
+        """测试用：把某路径登记成「已放行 / 运行中」。"""
+        self._unlocked.add(self._key(path))
+
+    def clear_running(self):
+        """测试用：清空全部放行与运行状态。"""
+        self._unlocked.clear()
+        self._running.clear()
 
     def unlocked_paths(self):
         return set(self._unlocked)
 
     def is_unlocked(self, path):
-        return path in self._unlocked
+        return self._key(path) in self._unlocked
 
     def is_running(self, path):
-        return path in self._unlocked or path in self._running
+        key = self._key(path)
+        return key in self._unlocked or key in self._running
 
     def running_pids(self, path):
         return [1234] if self.is_running(path) else []
+
+    def running_map(self, paths):
+        """真实引擎这里是**纯进程枚举**（不看放行账本），桩照此语义实现。"""
+        return {self._key(p): ([1234] if self._key(p) in self._running else [])
+                for p in paths}
+
+    def startup_pending(self, path):
+        return self._key(path) in self._pending
 
     def focus_running(self, path):
         self.focused.append(path)
@@ -118,12 +142,13 @@ class FakeInterceptor:
 
     def close_one(self, app):
         self.closed.append(app.get("path"))
-        self._unlocked.discard(app.get("path"))
-        self._running.discard(app.get("path"))
+        key = self._key(app.get("path"))
+        self._unlocked.discard(key)
+        self._running.discard(key)
         return 1
 
     def forget(self, path):
-        self._unlocked.discard(path)
+        self._unlocked.discard(self._key(path))
 
     def launch(self, app):
         self.launches.append(app.get("path"))
@@ -340,8 +365,7 @@ def main() -> int:
             return [b._label_text for b in btns]
 
         def _check_row_buttons():
-            interceptor._unlocked.clear()
-            interceptor._running.clear()
+            interceptor.clear_running()
             win.refresh()
             root.update()
             texts = _row_action_text(win, 0)
@@ -349,19 +373,19 @@ def main() -> int:
             check("未运行时出现「移除」", "移除" in texts, f"{texts}")
 
             # 让第一个应用进入运行态
-            interceptor._unlocked.add(r"C:\x\one.exe")
+            interceptor.mark_running(r"C:\x\one.exe")
             win.refresh()
             root.update()
             texts = _row_action_text(win, 0)
             check("运行时行按钮变「关闭」", "关闭" in texts, f"{texts}")
             check("运行时不再显示「启动」", "启动" not in texts, f"{texts}")
-            interceptor._unlocked.clear()
+            interceptor.clear_running()
 
         guard("行按钮启动/关闭切换", _check_row_buttons)
 
         def _check_close_one():
             calls: list = []
-            interceptor._unlocked.add(r"C:\x\one.exe")
+            interceptor.mark_running(r"C:\x\one.exe")
             win.refresh()
             root.update()
             old = interceptor.close_one
@@ -372,7 +396,7 @@ def main() -> int:
             finally:
                 interceptor.close_one = old
             check("行「关闭」调用 close_one", calls == [r"C:\x\one.exe"], f"{calls}")
-            interceptor._unlocked.clear()
+            interceptor.clear_running()
             win.refresh()
             root.update()
 
@@ -385,7 +409,7 @@ def main() -> int:
             「文件不存在」的 messagebox —— 无头环境下模态框会永久阻塞整个自检。
             """
             interceptor.launches.clear()
-            interceptor._unlocked.clear()
+            interceptor.clear_running()
             old_apps = list(win.store.apps)
             real = {"id": "real", "name": "真实文件", "path": str(exe), "enabled": True}
             win.store.data["apps"] = [real]
@@ -398,7 +422,7 @@ def main() -> int:
                       interceptor.launches == [str(exe)], f"{interceptor.launches}")
 
                 interceptor.launches.clear()
-                interceptor._unlocked.add(str(exe))
+                interceptor.mark_running(str(exe))
                 win.refresh()
                 root.update()
                 win.row_double_click(real)
@@ -406,7 +430,7 @@ def main() -> int:
                 check("双击已运行应用 -> 不再拉起新进程",
                       interceptor.launches == [], f"{interceptor.launches}")
             finally:
-                interceptor._unlocked.clear()
+                interceptor.clear_running()
                 win.store.data["apps"] = old_apps
                 win.refresh()
                 root.update()
@@ -420,8 +444,59 @@ def main() -> int:
                   "关闭全部应用" in labels, f"{labels[:8]}")
             check("不再出现旧文案「一键关闭全部应用」",
                   "一键关闭全部应用" not in labels)
+            check("工具条出现「刷新状态」按钮", "刷新状态" in labels, f"{labels[:8]}")
 
         guard("工具条文案", _check_toolbar_text)
+
+        # ---------------- 已添加应用状态检查（刷新状态） ----------------
+        print("\n[2.1.6] 状态检查：清理残留放行 + 刷新列表", flush=True)
+
+        def _check_status_button():
+            interceptor.clear_running()
+            win.refresh()
+            root.update()
+            texts = _row_action_text(win, 0)
+            check("无运行实例时行按钮为「启动」", "启动" in texts, f"{texts}")
+
+            # 账本里塞一条「进程其实已经退出」的残留（不在启动握手窗口内）
+            interceptor.mark_running(r"C:\x\one.exe")
+            win.refresh()
+            root.update()
+            texts = _row_action_text(win, 0)
+            check("账本有记录时显示为运行中", "关闭" in texts, f"{texts}")
+
+            n = win.check_status()
+            root.update()
+            check("刷新状态清掉残留放行会话", interceptor.unlocked_paths() == set(),
+                  f"{interceptor.unlocked_paths()}")
+            check("刷新状态返回真实运行数 0", n == 0, f"{n}")
+            texts = _row_action_text(win, 0)
+            check("刷新后行按钮回到「启动」", "启动" in texts, f"{texts}")
+
+            # 真正在运行的实例（进程枚举命中）仍然要被识别出来
+            interceptor._running.add(config_store.norm_path(r"C:\x\one.exe"))
+            n = win.check_status()
+            root.update()
+            check("真实运行的实例被识别为运行中", n == 1, f"{n}")
+            texts = _row_action_text(win, 0)
+            check("运行中行按钮为「关闭」", "关闭" in texts, f"{texts}")
+
+            # 刚点过「启动」（免密握手窗口内）的放行不能被误清
+            interceptor.clear_running()
+            interceptor.mark_running(r"C:\x\one.exe")
+            interceptor._pending.add(config_store.norm_path(r"C:\x\one.exe"))
+            win.check_status()
+            root.update()
+            check("启动握手窗口内的放行不被误清",
+                  interceptor.unlocked_paths() != set(),
+                  f"{interceptor.unlocked_paths()}")
+
+            interceptor._pending.clear()
+            interceptor.clear_running()
+            win.check_status()
+            root.update()
+
+        guard("状态检查刷新", _check_status_button)
 
         # ---------------- 退出鉴权（未通过密码） ----------------
         print("\n[2.2] 退出需密码：未通过时什么都不发生", flush=True)

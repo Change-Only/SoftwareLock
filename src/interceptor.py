@@ -550,8 +550,14 @@ class Interceptor:
             config_store.log(f"界面启动 {app.get('name')}：已在运行，改为置前")
             return True, "已在运行"
         workdir = os.path.dirname(path) or None
+        # 给目标一个**自己的控制台**：软件锁自身是无控制台的 GUI 进程，若让子进程
+        # 继承一个已经 EOF 的 stdin（例如软件锁由脚本/服务拉起），cmd.exe 这类控制台
+        # 程序会立刻读到 EOF 秒退——用户视角就是「点启动，窗口一闪就没了」。
+        # 对 GUI 程序无副作用（Windows 不会给 GUI 子系统程序显示控制台窗口）。
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
         try:
-            proc = subprocess.Popen([path], cwd=workdir, close_fds=True)
+            proc = subprocess.Popen([path], cwd=workdir, close_fds=True,
+                                    creationflags=flags)
             config_store.log(f"界面启动 {app.get('name')} pid={proc.pid}")
             return True, f"已启动（PID {proc.pid}）"
         except Exception as exc:
@@ -606,6 +612,54 @@ class Interceptor:
             except Exception:
                 continue
         return result
+
+    def running_map(self, paths) -> dict[str, list[int]]:
+        """一次进程枚举，批量给出多条 exe 路径各自正在运行的 pid 列表。
+
+        逐个调用 running_pids 是 O(应用数 × 进程数)；「刷新状态」要一次性检查
+        全部已添加应用，这里改成只遍历一遍进程表，再把命中的进程分派到各路径。
+        返回 {归一化路径: [pid, ...]}，未运行的路径对应空列表。
+        """
+        result: dict[str, list[int]] = {}
+        bases: set[str] = set()
+        for path in paths or ():
+            key = config_store.norm_path(path)
+            if not key:
+                continue
+            result.setdefault(key, [])
+            base = os.path.basename(key)
+            if base:
+                bases.add(base.lower())
+        if not result or not bases:
+            return result
+        me = os.getpid()
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info.get("pid") or 0
+                if not pid or pid == me:
+                    continue
+                if (proc.info.get("name") or "").lower() not in bases:
+                    continue
+                exe = winsys.process_exe(pid)
+                if not exe:
+                    continue
+                key = config_store.norm_path(exe)
+                if key in result:
+                    result[key].append(pid)
+            except Exception:
+                continue
+        return result
+
+    def startup_pending(self, path: str) -> bool:
+        """该路径是否刚在界面点过「启动」、进程可能还在创建中。
+
+        （免密握手窗口内。状态检查时用来避免把还没被枚举到的实例误判成已退出。）
+        """
+        key = config_store.norm_path(path)
+        if not key:
+            return False
+        with self._lock:
+            return self._ui_intent.get(key, 0.0) > time.time()
 
     def close_one(self, app: dict) -> int:
         """关闭单个受保护应用，返回被结束的进程数。

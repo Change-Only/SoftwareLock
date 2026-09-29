@@ -66,27 +66,39 @@ def main() -> int:
         def __init__(self):
             self._running = set()
 
+        # 引擎里的路径账本一律是归一化的，桩也照做，避免大小写带来假阴性
+        @staticmethod
+        def _key(path):
+            return config_store.norm_path(path)
+
         def unlocked_paths(self):
             return set(self._running)
 
         def is_unlocked(self, path):
-            return path in self._running
+            return self._key(path) in self._running
 
         def is_running(self, path):
-            return path in self._running
+            return self._key(path) in self._running
 
         def running_pids(self, path):
-            return [1] if path in self._running else []
+            return [1] if self.is_running(path) else []
+
+        def running_map(self, paths):
+            return {self._key(p): ([1] if self.is_running(p) else [])
+                    for p in paths}
+
+        def startup_pending(self, path):
+            return False
 
         def focus_running(self, path):
             return True
 
         def close_one(self, app):
-            self._running.discard(app.get("path"))
+            self._running.discard(self._key(app.get("path")))
             return 1
 
         def forget(self, path):
-            self._running.discard(path)
+            self._running.discard(self._key(path))
 
         def launch(self, app):
             return True, "stub"
@@ -107,10 +119,20 @@ def main() -> int:
 
     # 运行中：该行出现「运行中」标签，按钮切成「关闭」
     if store.apps:
-        interceptor._running.add(store.apps[0]["path"])
+        interceptor._running.add(config_store.norm_path(store.apps[0]["path"]))
         win.refresh()
         root.update()
         grab(root, "10-main-running")
+        interceptor._running.clear()
+        win.refresh()
+        root.update()
+
+    # 「刷新状态」后的提示（toast：状态已更新 · N 个应用正在运行）
+    if store.apps:
+        interceptor._running.add(config_store.norm_path(store.apps[0]["path"]))
+        win.check_status()
+        root.update()
+        grab(root, "11-status-checked", init=False)
         interceptor._running.clear()
         win.refresh()
         root.update()
