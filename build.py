@@ -12,10 +12,15 @@
 
 另外全程显式 ``--noupx``：UPX 压缩壳同样是误报高发特征。
 
+打包结束后会自动调用 ``tools/sign_artifacts.ps1`` 给产物签 Authenticode 签名
+（证书由 ``tools/selfsign_cert.ps1`` 一次性安装），使 UAC 提权提示显示发布者
+而不是「未知发布者」。证书未安装时只提示，不影响打包结果。
+
 用法：
     python build.py               # 单文件版 + 便携版
     python build.py --no-clean    # 复用上次的 build 缓存，速度更快
     python build.py --no-portable # 只出单文件版
+    python build.py --no-sign     # 跳过代码签名
 """
 from __future__ import annotations
 
@@ -55,6 +60,10 @@ VERSION = app_version()
 RELEASE_EXE_CN = f"软件锁-v{VERSION}.exe"
 RELEASE_DIR_CN = f"软件锁便携版-v{VERSION}"
 RELEASE_ZIP = f"软件锁便携版-v{VERSION}.zip"
+
+# 产物签名：证书由 tools/selfsign_cert.ps1 一次性装入当前用户存储，
+# 之后每次打包由本脚本自动给 exe 补 Authenticode 签名。
+SIGN_SCRIPT = ROOT / "tools" / "sign_artifacts.ps1"
 
 EXCLUDES = [
     "numpy", "pandas", "matplotlib", "scipy", "PyQt5", "PyQt6", "PySide2",
@@ -134,7 +143,7 @@ def make_version_file() -> Path:
         import config_store
         version = config_store.APP_VERSION
     except Exception:
-        version = "1.4.3"
+        version = VERSION if VERSION and VERSION != "0.0.0" else "1.4.4"
     parts = (version.split(".") + ["0", "0", "0", "0"])[:4]
     quad = ", ".join(str(int(p) if str(p).isdigit() else 0) for p in parts)
     path.write_text(
@@ -298,8 +307,20 @@ def _build_portable(icon_ok: bool, version_file: Path, binaries: list,
         target = exe_in_dir
     total = sum(f.stat().st_size for f in final_dir.rglob("*") if f.is_file())
     print(f"√ 便携版: {target}  (整目录 {total / 1024 / 1024:.1f} MB)")
+    # 压缩包在签名完成后再生成（见 _make_zip），否则 zip 里装的是未签名的 exe
+    return 0
 
-    # 打包一份 zip，供 Release 直接分发（目录版解压即用，无需安装）
+
+def _make_zip() -> None:
+    """把便携版目录压缩成 zip，供 Release 直接分发（解压即用）。
+
+    必须在签名之后调用：zip 一旦生成，里面的 exe 就定格了，
+    先压缩后签名会导致下载到的 exe 仍是未签名状态。
+    """
+    final_dir = DIST / RELEASE_DIR_CN
+    if not final_dir.is_dir():
+        print(f"! 未找到便携版目录，跳过压缩包: {final_dir}")
+        return
     zip_path = DIST / RELEASE_ZIP
     try:
         _backup_path(zip_path, "便携版压缩包")
@@ -310,10 +331,41 @@ def _build_portable(icon_ok: bool, version_file: Path, binaries: list,
               f"({zip_path.stat().st_size / 1024 / 1024:.1f} MB)")
     except Exception as exc:
         print(f"! 便携版压缩包生成失败: {exc}")
+
+
+def sign_artifacts() -> int:
+    """给 dist 下的打包产物补 Authenticode 代码签名。
+
+    证书来自当前用户的证书存储，由 ``tools/selfsign_cert.ps1`` 一次性安装。
+    装好证书后，签名后的 exe 在 UAC 提权对话框里会显示发布者「SoftwareLock」，
+    不再提示「此文件没有包含有效的数字签名以验证其发布者」。
+
+    签名只是加固手段：证书缺失或签名失败都不影响打包结果本身，只提示。
+    """
+    if not SIGN_SCRIPT.is_file():
+        print(f"! 未找到签名脚本，跳过签名: {SIGN_SCRIPT}")
+        return 0
+    powershell = (shutil.which("powershell.exe") or shutil.which("powershell")
+                  or "powershell.exe")
+    cmd = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", str(SIGN_SCRIPT)]
+    print("\n$ " + " ".join(cmd) + "\n")
+    try:
+        proc = subprocess.run(cmd, cwd=str(ROOT))
+    except Exception as exc:
+        print(f"! 调用签名脚本失败（跳过签名）: {exc}")
+        return 0
+    if proc.returncode == 0:
+        print("√ 产物签名完成")
+    elif proc.returncode == 2:
+        print("! 未安装签名证书，产物保持未签名状态")
+        print("  如需签名请先运行: tools\\selfsign_cert.ps1")
+    else:
+        print(f"! 签名过程存在失败项（exit={proc.returncode}），产物可能未全部签名")
     return 0
 
 
-def build(clean: bool = True, portable: bool = True) -> int:
+def build(clean: bool = True, portable: bool = True, sign: bool = True) -> int:
     if not check_deps():
         return 1
     icon_ok = make_icon()
@@ -331,6 +383,12 @@ def build(clean: bool = True, portable: bool = True) -> int:
         if _build_portable(icon_ok, version_file, binaries, datas, clean) != 0:
             print("  （便携版打包失败，单文件版仍可用）")
 
+    # 顺序很重要：先给 exe 签名，再压 zip，否则 zip 里装的是未签名副本
+    if sign:
+        sign_artifacts()
+    if portable:
+        _make_zip()
+
     print("\n√ 打包完成")
     return 0
 
@@ -340,8 +398,11 @@ def main() -> int:
     parser.add_argument("--no-clean", action="store_true", help="复用 build 缓存")
     parser.add_argument("--no-portable", action="store_true",
                         help="只打单文件版，跳过便携目录版")
+    parser.add_argument("--no-sign", action="store_true",
+                        help="跳过代码签名（默认会给产物签 Authenticode 签名）")
     args = parser.parse_args()
-    return build(clean=not args.no_clean, portable=not args.no_portable)
+    return build(clean=not args.no_clean, portable=not args.no_portable,
+                 sign=not args.no_sign)
 
 
 if __name__ == "__main__":

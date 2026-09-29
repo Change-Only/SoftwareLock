@@ -148,6 +148,12 @@
    软件锁会回退为普通权限运行，此时管理员程序无法被拦截——主界面顶部会出现
    橙色提示条，可点其中的「以管理员身份重启」（需密码）再次提权。
 
+   本仓库产出的 exe 在签过名之后，UAC 里显示的发布者是 **SoftwareLock**。
+   若你的 UAC 里仍显示「未知发布者」并附带一句**「此文件没有包含有效的数字签名
+   以验证其发布者」**，说明这个 exe 还没签名——这只是 Windows 对未签名程序的
+   标准提示，**不是病毒警告**，点「是」即可正常使用；想消除它请执行一次
+   `tools\selfsign_cert.ps1`，详见第五章第 4 条。
+
 2. **检测有一个很短的时间窗。**
    默认扫描间隔下，程序可能有一瞬间（约 0.1 秒）的启动动作，
    随即被冻结并隐藏。把扫描间隔调成「快速（60 毫秒）」可以进一步缩小这个窗口。
@@ -196,9 +202,41 @@
    "Submit a file for malware analysis"，上传 `软件锁.exe` 并在备注里说明
    这是自己编写的本地应用锁工具、无网络行为、源码可查。微软通常几天内更新特征库。
 
-4. **根本解决：给 exe 做代码签名**
-   有代码签名证书（EV 证书效果最好）后，用 `signtool sign` 签名，
-   杀软与 SmartScreen 都会直接放行，不再需要排除项。
+4. **代码签名（本仓库已内置自签名方案）**
+
+   签名解决的是「发布者身份」问题。Windows 对未签名程序有**两类**提示，效果不同：
+
+   | 提示 | 出自哪里 | 自签名能否消除 |
+   | --- | --- | --- |
+   | UAC 提权框显示「未知发布者」，展开后有「此文件没有包含有效的数字签名以验证其发布者」 | 用户账户控制（UAC） | ✅ 能，发布会显示为 `SoftwareLock` |
+   | 「Windows 已保护你的电脑」蓝色大框，需要点「更多信息 → 仍要运行」 | SmartScreen | ❌ 不能，需要 CA 签发的 OV/EV 证书并累积信誉 |
+
+   本仓库自带一套**零成本**的自签名方案，只写入**当前用户**的证书存储，
+   不需要管理员权限，也不影响其他 Windows 账户：
+
+   ```powershell
+   # 一次性：生成自签名代码签名证书，并装入「受信任的根证书颁发机构」
+   powershell -NoProfile -ExecutionPolicy Bypass -File tools\selfsign_cert.ps1
+
+   # 之后每次打包由 build.py 自动调用；也可以手动单独签
+   powershell -NoProfile -ExecutionPolicy Bypass -File tools\sign_artifacts.ps1
+   ```
+
+   证书有效期 10 年，可重复执行（已存在则复用）。
+
+   执行 `selfsign_cert.ps1` 时会弹出**一次** Windows「安全警告」对话框——
+   这是系统的「受保护根证书」机制，防止程序静默安装根证书。**点「是」**即可，
+   之后不会再弹。
+
+   ⚠️ **适用范围**：自签名只对**导入了这张证书的机器**有效。你自己这台电脑上
+   UAC 会显示 `SoftwareLock`；别人拿去用仍然是「未知发布者」。要让所有用户都
+   看到发布者名，需要购买 CA 签发的证书（OV 约 ¥1500–3000/年，EV 约
+   ¥3000–6000/年）；EV 能立刻获得 SmartScreen 信誉，OV 需要累积下载量。
+
+   ⚠️ **私钥务必保管好**：`build/certs/SoftwareLock.pfx` 与同目录的
+   `pfx_password.txt` 合起来就是这把「发布者身份」的钥匙，泄露等于别人可以
+   冒用你的名义签任何程序。该目录已被 `.gitignore` 排除，不会进入版本库。
+   换机器时把这两个文件拷过去，再跑一次 `selfsign_cert.ps1` 即可恢复。
 
 > 另外注意：如果 exe 是从聊天工具 / 网盘 / 邮件里拿到的，Windows 会打上
 >"来自 Internet" 标记（Mark of the Web），此时双击还可能额外出现
@@ -254,7 +292,14 @@ python tools/smoketest_exe.py           # 打包产物端到端冒烟
 ```bash
 python build.py               # 同时产出「单文件版」和「便携目录版」
 python build.py --no-portable # 只出单文件版
+python build.py --no-sign     # 跳过代码签名
 ```
+
+打包结束后会**自动**调用 `tools/sign_artifacts.ps1` 给产物签 Authenticode 签名
+（证书见第五章第 4 条；未安装证书时只提示、不影响打包结果）。
+
+打包流程固定为 **先签名、再压 zip**：zip 一旦生成，里面的 exe 就定格了，
+顺序反了会导致下载到的便携版里仍是未签名副本。
 
 产物：
 
@@ -311,7 +356,12 @@ python build.py --no-portable # 只出单文件版
 │  ├─ selftest_interceptor.py  拦截引擎自检（不依赖界面）
 │  ├─ selftest_ui.py           界面/退出鉴权/搜索过滤 自检
 │  ├─ smoketest_exe.py         打包产物端到端冒烟测试
+│  ├─ selfsign_cert.ps1        一次性安装自签名代码签名证书（当前用户，免管理员）
+│  ├─ sign_artifacts.ps1       给 dist 产物签 Authenticode 签名
 │  └─ uishot.py                渲染界面截图供人工确认
 ├─ build.py
 └─ requirements.txt
 ```
+
+> `build/certs/` 是签名证书的落盘位置（含 `.pfx` 私钥与密码），
+> 已被 `.gitignore` 排除，**不要**提交或外发。
