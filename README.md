@@ -363,6 +363,7 @@ python build.py --no-sign     # 跳过代码签名
 │  ├─ smoketest_exe.py         打包产物端到端冒烟测试
 │  ├─ selfsign_cert.ps1        一次性安装自签名代码签名证书（当前用户，免管理员）
 │  ├─ sign_artifacts.ps1       给 dist 产物签 Authenticode 签名
+│  ├─ verify_signature.py      校验产物签名（WinVerifyTrust，与 UAC 同源）
 │  └─ uishot.py                渲染界面截图供人工确认
 ├─ build.py
 └─ requirements.txt
