@@ -229,7 +229,7 @@ class LineEntry(tk.Frame):
         pad_x, pad_y = T.px(10), T.px(8)
         self.entry.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
         # 关闭几何传播：宽度/高度由本控件显式决定，否则 1 字符的 Entry 会把
-        # Frame 压缩到极窄（工具条里的搜索框就会显示不全）。
+        # Frame 压缩到极窄（输入框就会显示不全）。
         try:
             natural_h = self.entry.winfo_reqheight() + 2 * pad_y
         except Exception:

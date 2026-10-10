@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""UI 自检：完整构建主窗口与所有对话框，验证退出鉴权 / 搜索过滤 / 布局不裁切。
+"""UI 自检：完整构建主窗口与所有对话框，验证退出鉴权 / 列表渲染 / 布局不裁切。
 
 覆盖的可证伪断言：
   * 未通过密码时点击托盘「退出软件锁」「完全退出并停止保护」 -> on_quit 不被调用、
     interceptor.stop 不被调用、窗口仍在；
   * 通过密码后「退出软件锁」 -> 窗口 withdrawn、托盘图标隐藏、on_quit 仍不被调用；
   * 通过密码后「完全退出并停止保护」 -> on_quit 被调用一次；
-  * 搜索过滤按 name/path 子串命中，行数符合预期；
+  * 主窗口列表按应用数量渲染、无应用时显示空态；
   * 每个对话框构建后 req <= win（不裁切）；
   * 密码框 danger 样式与「显示密码」开关。
 
@@ -204,7 +204,7 @@ class FakeTray:
 
 
 def _make_apps(store):
-    """插入 3 个假应用（2 启用 1 停用），用于搜索过滤与列表渲染。"""
+    """插入 3 个假应用（2 启用 1 停用），用于列表渲染与状态断言。"""
     store.data["apps"] = [
         {"id": "a1", "name": "测试应用一", "path": r"C:\x\one.exe", "enabled": True},
         {"id": "a2", "name": "测试应用二", "path": r"C:\x\two.exe", "enabled": True},
@@ -299,20 +299,33 @@ def main() -> int:
                        check("列表行数=3", len(win._row_widgets) == 3,
                              f"{len(win._row_widgets)}")))
 
-        # ---------------- 搜索过滤 ----------------
-        print("\n[2.1] 搜索过滤", flush=True)
-        guard("按名称子串过滤", lambda: _search(win, root, "测试", 2))
-        guard("部分名称过滤", lambda: _search(win, root, "应用一", 1))
-        guard("按路径子串过滤", lambda: _search(win, root, "three.exe", 1))
-        guard("无匹配返回空列表", lambda: _search(win, root, "不存在xyz", 0))
-        guard("清空搜索恢复全部", lambda: _search(win, root, "", 3))
+        # ---------------- 搜索框已移除（v1.4.6）----------------
+        print("\n[2.1] 工具条与空态", flush=True)
+        guard("工具条不再有搜索框",
+              lambda: check("无 search 属性", not hasattr(win, "search")))
 
-        # ---------------- 空态按钮 ----------------
-        guard("空态按钮（无匹配）",
-              lambda: (win.search.set("没有这个"), root.update(),
-                       check("空态已渲染",
-                             len(win.scroll.body.winfo_children()) >= 1),
-                       win.search.set(""), root.update()))
+        def _empty_state():
+            saved = list(win.store.apps)
+            win.store.data["apps"] = []
+            win.refresh()
+            root.update()
+
+            def _texts(w):
+                out = []
+                for ch in w.winfo_children():
+                    if isinstance(ch, tk.Label):
+                        out.append(ch.cget("text") or "")
+                    out.extend(_texts(ch))
+                return out
+
+            texts = _texts(win.scroll.body)
+            check("无应用时渲染空态提示",
+                  any("还没有受保护的应用" in t for t in texts), f"{texts}")
+            win.store.data["apps"] = saved
+            win.refresh()
+            root.update()
+
+        guard("空态（无应用）", _empty_state)
 
         class _Evt:
             action = "blocked"
@@ -773,19 +786,12 @@ def main() -> int:
 
 
 def _check_placeholder(root, entry_cls):
-    ent = entry_cls(root, width=200, placeholder="搜索应用…")
+    ent = entry_cls(root, width=200, placeholder="请输入…")
     ent.pack()
     root.update()
-    check("占位提示存在", ent._placeholder == "搜索应用…")
+    check("占位提示存在", ent._placeholder == "请输入…")
     check("空值时不污染 get()", ent.get() == "")
     ent.destroy()
-
-
-def _search(win, root, text, expected):
-    win.search.set(text)
-    root.update()
-    check(f"搜索「{text}」-> {expected} 行",
-          len(win._row_widgets) == expected, f"{len(win._row_widgets)}")
 
 
 if __name__ == "__main__":

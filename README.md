@@ -30,8 +30,7 @@
 
 界面底部可以随时看到「已保护 N 个应用 / 已拦截 M 次」。
 
-主界面工具条：「添加应用」「**关闭全部应用**」「**刷新状态**」「设置」「隐藏到托盘」，
-右侧是搜索框。
+主界面工具条：「添加应用」「**关闭全部应用**」「**刷新状态**」「设置」，右侧「隐藏到托盘」。
 每行应用右侧的标签显示「已启用 / 已停用」（点击可切换是否保护），旁边是「启动 / 关闭」
 与「移除」按钮——**按钮会跟着应用的真实运行状态自动切换**。
 
@@ -269,7 +268,7 @@ python src/main.py --minimized  # 直接最小化到托盘
 ```bash
 python tools/selftest_interceptor.py    # 拦截引擎（不依赖界面）
 python tools/selftest_unlock_scope.py   # 放行范围（关闭后重开必须重新要密码）
-python tools/selftest_ui.py             # 界面构建 / 退出鉴权 / 搜索过滤 / 布局
+python tools/selftest_ui.py             # 界面构建 / 退出鉴权 / 布局
 python tools/smoketest_exe.py           # 打包产物端到端冒烟
 ```
 
@@ -282,7 +281,7 @@ python tools/smoketest_exe.py           # 打包产物端到端冒烟
 **无窗口僵尸进程不得给会话续命**、有窗口的正常会话不受无窗口规则影响。
 
 `selftest_ui.py` 会真实构建主窗口与所有对话框，验证退出需密码、退出后后台仍保护、
-搜索过滤、对话框不裁切等。测试数据全部落在临时目录，不影响真实配置。
+列表渲染与空态、对话框不裁切等。测试数据全部落在临时目录，不影响真实配置。
 
 > `smoketest_exe.py` 通过 `SOFTLOCK_DATA_DIR` 环境变量把被测 exe 的数据目录隔离到临时目录，
 > 绝不写 `dist/config.json` —— 否则用户升级新版时会被判定为「已有配置」而跳过旧数据迁移。
@@ -360,7 +359,7 @@ python build.py --no-sign     # 跳过代码签名
 │  └─ softlock.ico       打包用图标（由 build.py 自动生成）
 ├─ tools/
 │  ├─ selftest_interceptor.py  拦截引擎自检（不依赖界面）
-│  ├─ selftest_ui.py           界面/退出鉴权/搜索过滤 自检
+│  ├─ selftest_ui.py           界面/退出鉴权/布局 自检
 │  ├─ smoketest_exe.py         打包产物端到端冒烟测试
 │  ├─ selfsign_cert.ps1        一次性安装自签名代码签名证书（当前用户，免管理员）
 │  ├─ sign_artifacts.ps1       给 dist 产物签 Authenticode 签名

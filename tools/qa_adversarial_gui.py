@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""QA 第四轮对抗用例（需要界面）：C4 密码冷却 / C5 搜索过滤边界 /
+"""QA 第四轮对抗用例（需要界面）：C4 密码冷却 / C5 列表渲染与分隔线 /
 C6 对话框不回归 / C8 托盘隐藏恢复。
 
 运行：python tools/qa_adversarial_gui.py
@@ -111,14 +111,15 @@ def _rows(win):
 
 
 def _separators(win):
-    """统计带 1px 分隔线的行数（hline 是 height=1 的 Frame）。"""
+    """统计带分隔线的行数（hline 是高度 max(1, T.px(1)) 的 Frame，随 DPI 缩放）。"""
+    needle = max(1, T.px(1))
     n = 0
     for row in win.scroll.body.winfo_children():
         if not isinstance(row, tk.Frame):
             continue
         for ch in row.winfo_children():
             try:
-                if isinstance(ch, tk.Frame) and int(ch.cget("height")) == 1:
+                if isinstance(ch, tk.Frame) and int(ch.cget("height")) == needle:
                     n += 1
                     break
             except Exception:
@@ -127,7 +128,7 @@ def _separators(win):
 
 
 def test_c5(root, tmp):
-    print("\n[C5] 搜索过滤边界（正则特殊字符 / 中文 / 大小写 / 路径 / 分隔线）", flush=True)
+    print("\n[C5] 列表渲染与分隔线（搜索框已于 v1.4.6 移除）", flush=True)
     store = Store(tmp / "c5.json")
     store.set_password("x")
     store.data["apps"] = [
@@ -143,48 +144,19 @@ def test_c5(root, tmp):
                      lambda then=None: None)
     root.update()
 
-    def search(text):
-        win.search.set(text)
-        root.update()
-        return _rows(win)
+    check("主窗口不再提供搜索框", not hasattr(win, "search"))
+    check("全部 4 行渲染", _rows(win) == 4, f"{_rows(win)}")
+    check("4 行时分隔线 = 3", _separators(win) == 3, f"{_separators(win)}")
 
-    for kw in ["(", "[", "*", ")", "\\", "+", "?", ".*", "^$", "|"]:
-        try:
-            n = search(kw)
-            check(f"搜索正则特殊字符 {kw!r} 不抛异常", True, f"rows={n}")
-        except Exception as exc:
-            check(f"搜索正则特殊字符 {kw!r} 不抛异常", False, repr(exc))
+    # 特殊字符名称/路径不应影响渲染
+    check("含特殊字符的应用均可渲染（无异常）", _rows(win) == 4, f"{_rows(win)}")
 
-    check("中文关键字「微信」命中 1", search("微信") == 1, f"{_rows(win)}")
-    check("中文关键字「工具」命中 1", search("工具") == 1, f"{_rows(win)}")
-    check("中文括号特殊字符「(测试)」命中 1", search("(测试)") == 1, f"{_rows(win)}")
-    check("大小写不敏感「myapp」命中 1", search("myapp") == 1, f"{_rows(win)}")
-    check("大小写不敏感「notepad」命中 1", search("notepad") == 1, f"{_rows(win)}")
-    check("路径片段「wechat.exe」命中 1", search("wechat.exe") == 1, f"{_rows(win)}")
-    check("路径片段「C:\\c」命中 1", search(r"C:\c") == 1, f"{_rows(win)}")
-    check("无匹配 -> 0 行", search("zzz不存在") == 0, f"{_rows(win)}")
-
-    # 分隔线：过滤态下应为 (行数 - 1) 条，且不随「移除」错位
-    search("")
-    check("全部 4 行时分隔线 = 3", _separators(win) == 3, f"{_separators(win)}")
-    search("exe")
-    n_exe = _rows(win)
-    check(f"过滤到 {n_exe} 行时分隔线 = {max(0, n_exe - 1)}",
-          _separators(win) == max(0, n_exe - 1), f"rows={n_exe} seps={_separators(win)}")
-    search("notepad")
-    check("过滤到 1 行时分隔线 = 0", _separators(win) == 0,
-          f"rows={_rows(win)} seps={_separators(win)}")
-
-    # 过滤态下「移除」中间一行：应按 id 删除，不产生错位
-    search("")
-    root.update()
-    before_ids = [a["id"] for a in store.apps]
+    # 移除中间一行：应按 id 删除，分隔线随之收缩，不产生错位
     target_app = next(a for a in store.apps if a["id"] == "2")
     win.remove_app(target_app)
     root.update()
     after_ids = [a["id"] for a in store.apps]
-    check("过滤态移除按 id 精确删除（无索引错位）",
-          after_ids == [i for i in before_ids if i != "2"], str(after_ids))
+    check("移除按 id 精确删除（无索引错位）", after_ids == ["1", "3", "4"], str(after_ids))
     check("移除后行数 = 3", _rows(win) == 3, f"{_rows(win)}")
     check("移除后分隔线 = 2", _separators(win) == 2, f"{_separators(win)}")
 

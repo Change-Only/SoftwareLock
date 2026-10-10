@@ -13,7 +13,7 @@ from config_store import Store
 
 from . import theme as T
 from .dialogs import SettingsDialog, app_photo, image_photo
-from .widgets import LineEntry, Pill, RoundedButton, ScrollFrame, hline
+from .widgets import Pill, RoundedButton, ScrollFrame, hline
 
 # 轻提示 Toast 的存活时长（毫秒）
 TOAST_MS = 2400
@@ -46,7 +46,6 @@ class MainWindow:
         self._row_widgets: list = []
         self._last_event_text = "暂无活动"
         self._authenticated = False
-        self._search_text = ""
         self._toast = None
         self._refresh_job = None
 
@@ -145,9 +144,6 @@ class MainWindow:
 
         RoundedButton(bar, "隐藏到托盘", command=self.hide, kind="ghost",
                       width=112, height=36, bg=T.BG).pack(side="right")
-        self.search = LineEntry(bar, width=200, placeholder="搜索应用…")
-        self.search.pack(side="right", padx=(0, 10))
-        self.search.var.trace_add("write", lambda *a: self._on_search())
 
     # -------------------------------------------------------------- 列表
     def _build_list(self):
@@ -181,28 +177,10 @@ class MainWindow:
         return "break"
 
     def _on_escape(self, _e=None):
-        if self._search_text:
-            self.search.set("")  # 触发 trace -> _on_search 清空过滤
-            return "break"
         self.hide()
         return "break"
 
     # ================================================================= 刷新
-    def _filtered_apps(self) -> list:
-        apps = list(self.store.apps)
-        text = (self._search_text or "").lower()
-        if not text:
-            return apps
-        return [
-            a for a in apps
-            if text in (a.get("name") or "").lower()
-            or text in (a.get("path") or "").lower()
-        ]
-
-    def _on_search(self):
-        self._search_text = (self.search.get() or "").strip()
-        self.refresh()
-
     def refresh_later(self, delay: int = REFRESH_COALESCE_MS):
         """把多次刷新请求合并成一次（放行/关闭会连续触发多条事件）。"""
         if self._refresh_job is not None:
@@ -261,9 +239,9 @@ class MainWindow:
         self._row_widgets = []
         if running_paths is None:
             running_paths = self._running_paths_now()
-        apps = self._filtered_apps()
+        apps = list(self.store.apps)
         if not apps:
-            self._build_empty_state(has_filter=bool(self._search_text))
+            self._build_empty_state()
         else:
             total = len(apps)
             for index, app in enumerate(apps):
@@ -356,16 +334,9 @@ class MainWindow:
         self.push_event_text(f"已检查应用状态（运行中 {running_now} / 共 {total}）")
         return running_now
 
-    def _build_empty_state(self, has_filter: bool = False):
+    def _build_empty_state(self):
         box = tk.Frame(self.scroll.body, bg=T.CARD)
         box.pack(fill="both", expand=True, pady=T.px(60))
-        if has_filter:
-            tk.Label(box, text="没有匹配的应用", bg=T.CARD, fg=T.TEXT,
-                     font=(T.fonts()["family"], 12, "bold")).pack()
-            tk.Label(box, text="试试其它关键字，或按 Esc 清空搜索查看全部。",
-                     bg=T.CARD, fg=T.MUTED,
-                     font=(T.fonts()["family"], 9)).pack(pady=(10, 0))
-            return
         tk.Label(box, text="还没有受保护的应用", bg=T.CARD, fg=T.TEXT,
                  font=(T.fonts()["family"], 12, "bold")).pack()
         tk.Label(
