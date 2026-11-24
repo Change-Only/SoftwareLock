@@ -21,7 +21,7 @@ from pathlib import Path
 
 APP_NAME = "SoftwareLock"
 APP_DISPLAY_NAME = "软件锁"
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 
 # 旧版数据目录（升级迁移用）
 LEGACY_APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
@@ -344,6 +344,22 @@ class Store:
             if changed:
                 self.save()
             return changed
+
+    def reorder_apps(self, ordered_ids: list) -> bool:
+        """按给定 id 顺序重排应用列表（主界面拖拽排序用）。
+
+        只有 id 集合与现有应用**完全一致**时才落盘，并且拒绝重复 id——
+        界面状态异常时宁可放弃这次排序，也不能把应用弄丢或复制。
+        """
+        with _lock:
+            by_id = {a.get("id"): a for a in self.apps}
+            if (len(ordered_ids) != len(by_id)
+                    or len(set(ordered_ids)) != len(ordered_ids)
+                    or set(ordered_ids) != set(by_id)):
+                return False
+            self.data["apps"] = [by_id[app_id] for app_id in ordered_ids]
+            self.save()
+            return True
 
     def set_enabled(self, app_id: str, enabled: bool) -> None:
         with _lock:

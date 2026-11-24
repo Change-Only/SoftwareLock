@@ -111,7 +111,11 @@ def _rows(win):
 
 
 def _separators(win):
-    """统计带分隔线的行数（hline 是高度 max(1, T.px(1)) 的 Frame，随 DPI 缩放）。"""
+    """统计**可见**的分隔线条数。
+
+    分隔线高度是 max(1, T.px(1))（随 DPI 缩放）；末行那条只是 pack_forget
+    掉、仍是子控件，所以必须同时检查 winfo_manager() 才能只数可见的。
+    """
     needle = max(1, T.px(1))
     n = 0
     for row in win.scroll.body.winfo_children():
@@ -119,7 +123,9 @@ def _separators(win):
             continue
         for ch in row.winfo_children():
             try:
-                if isinstance(ch, tk.Frame) and int(ch.cget("height")) == needle:
+                if (isinstance(ch, tk.Frame)
+                        and int(ch.cget("height")) == needle
+                        and ch.winfo_manager()):
                     n += 1
                     break
             except Exception:
@@ -159,6 +165,57 @@ def test_c5(root, tmp):
     check("移除按 id 精确删除（无索引错位）", after_ids == ["1", "3", "4"], str(after_ids))
     check("移除后行数 = 3", _rows(win) == 3, f"{_rows(win)}")
     check("移除后分隔线 = 2", _separators(win) == 2, f"{_separators(win)}")
+
+    # ---------------- 拖拽排序 ----------------
+    class _Evt:
+        y_root = 0
+
+    rows = win._row_widgets
+    before = [a["id"] for a in store.apps]
+    first, last = rows[0], rows[-1]
+    ev = _Evt()
+    win._drag_start(ev, store.apps[0], first)
+    # 落在最后一行下边缘之外 -> 目标位置 = 末位
+    ev.y_root = win.scroll.body.winfo_rooty() + last.winfo_y() + last.winfo_height()
+    win._drag_motion(ev)
+    win._drag_end(ev)
+    root.update()
+
+    after = [a["id"] for a in store.apps]
+    check("拖拽后顺序已落盘（首行移到末尾）", after == before[1:] + before[:1], str(after))
+    check("拖拽后行数不变", _rows(win) == 3, f"{_rows(win)}")
+    check("拖拽后分隔线仍为 2", _separators(win) == 2, f"{_separators(win)}")
+
+    # 再把它拖回首位，验证反向移动与顺序可复原
+    rows = win._row_widgets
+    moving, head = rows[-1], rows[0]
+    ev2 = _Evt()
+    win._drag_start(ev2, store.apps[-1], moving)
+    ev2.y_root = win.scroll.body.winfo_rooty() + head.winfo_y()
+    win._drag_motion(ev2)
+    win._drag_end(ev2)
+    root.update()
+    check("拖回首位后顺序复原", [a["id"] for a in store.apps] == before,
+          str([a["id"] for a in store.apps]))
+    check("拖回首位后分隔线仍为 2", _separators(win) == 2, f"{_separators(win)}")
+
+    # 只有一行时不应进入拖拽态（避免把手柄点击当成排序）
+    one = Store(tmp / "c5-one.json")
+    one.set_password("x")
+    one.data["apps"] = [{"id": "solo", "name": "Only", "path": r"C:\z\only.exe",
+                         "enabled": True}]
+    one.save()
+    top = tk.Toplevel(root)
+    top.withdraw()
+    win_one = MainWindow(top, one, FakeInterceptor(), FakeBroker(), FakeTray(),
+                         lambda then=None: None)
+    root.update()
+    e3 = _Evt()
+    win_one._drag_start(e3, one.apps[0], win_one._row_widgets[0])
+    check("仅一行时不允许拖拽", win_one._drag_row is None)
+    win_one._drag_end(e3)
+    top.destroy()
+    root.update()
 
 
 def test_c6(root, store):

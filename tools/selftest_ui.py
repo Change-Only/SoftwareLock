@@ -327,6 +327,29 @@ def main() -> int:
 
         guard("空态（无应用）", _empty_state)
 
+        # ---------------- 拖拽排序 ----------------
+        print("\n[2.2] 拖拽排序", flush=True)
+
+        def _grip_and_reorder():
+            row = win._row_widgets[0]
+            grips = [w for w in row.winfo_children()[0].winfo_children()
+                     if isinstance(w, tk.Canvas)]
+            check("行首有拖拽手柄", bool(grips), f"{len(grips)}")
+            ids = [a["id"] for a in win.store.apps]
+            check("reorder_apps 拒绝缺失 id",
+                  win.store.reorder_apps(ids[:-1]) is False)
+            check("reorder_apps 拒绝重复 id",
+                  win.store.reorder_apps([ids[0]] * len(ids)) is False)
+            check("reorder_apps 接受完整 id 集合",
+                  win.store.reorder_apps(list(reversed(ids))) is True)
+            check("顺序已反转",
+                  [a["id"] for a in win.store.apps] == list(reversed(ids)))
+            win.store.reorder_apps(ids)     # 复原
+            win.refresh()
+            root.update()
+
+        guard("拖拽手柄与重排校验", _grip_and_reorder)
+
         class _Evt:
             action = "blocked"
             name = "测试应用一"

@@ -48,6 +48,11 @@ class MainWindow:
         self._authenticated = False
         self._toast = None
         self._refresh_job = None
+        # 拖拽排序状态：拖拽期间禁止重建列表（重建会销毁被拖动的行，隐式抓取失效）
+        self._drag_row = None
+        self._drag_app = None
+        self._drag_moved = False
+        self._refresh_after_drag = False
 
         self._build()
 
@@ -235,6 +240,12 @@ class MainWindow:
     def refresh(self, running_paths=None):
         if not self.root.winfo_exists():
             return
+        if self._drag_row is not None:
+            # 拖拽过程中重建列表会销毁正在拖动的行，隐式抓取随之中断；
+            # 记下来，等松手后再补一次刷新。
+            self._refresh_after_drag = True
+            return
+        self._refresh_after_drag = False
         self.scroll.clear()
         self._row_widgets = []
         if running_paths is None:
@@ -257,8 +268,10 @@ class MainWindow:
                  f"· 已放行 {stats.get('allowed', 0)} 次 · 运行中 {running}"
         )
         self.event_label.configure(text=f"最近活动：{self._last_event_text}")
+        hint = "  ·  拖动行首圆点可排序" if len(apps) > 1 else ""
         self.sub_label.configure(
-            text=f"后台守护运行中 · 扫描间隔 {self.store.settings.get('poll_interval_ms', 120)} 毫秒"
+            text=f"后台守护运行中 · 扫描间隔 "
+                 f"{self.store.settings.get('poll_interval_ms', 120)} 毫秒{hint}"
         )
         if running:
             self.status_pill.update_pill(f"已解锁 {running}", fg=T.WARN, bg=T.WARN_SOFT)
@@ -354,6 +367,18 @@ class MainWindow:
         inner = tk.Frame(row, bg=T.CARD)
         inner.pack(fill="x", padx=T.px(18), pady=T.px(11))
 
+        # 行首拖拽手柄（六个小圆点）：只在手柄上起拖，避免和双击启动、
+        # 行内按钮抢事件。
+        grip = self._make_grip(inner)
+        grip.pack(side="left", padx=(0, T.px(8)))
+
+        def _on_grip_press(_e=None, a=app, r=row):
+            self._drag_start(_e, a, r)
+
+        grip.bind("<Button-1>", _on_grip_press)
+        grip.bind("<B1-Motion>", self._drag_motion)
+        grip.bind("<ButtonRelease-1>", self._drag_end)
+
         photo = image_photo(app.get("path", ""), app.get("name", ""), T.px(34))
         if photo is not None:
             icon = tk.Label(inner, image=photo, bg=T.CARD)
@@ -406,13 +431,20 @@ class MainWindow:
         RoundedButton(actions, "移除", command=lambda a=app: self.remove_app(a),
                       kind="ghost", width=76, height=32, bg=T.CARD).pack(side="left", padx=(8, 0))
 
+        # 分隔线始终创建、只有非末行才 pack：拖拽换位时靠它保证分隔线永远只
+        # 出现在「行与行之间」，不会跟着某行跑到末尾，也不会让中间断开。
+        sep = hline(row, T.BORDER)
         if index < total - 1:
-            hline(row, T.BORDER).pack(fill="x", padx=T.px(18))
+            sep.pack(fill="x", padx=T.px(18))
+        row._sep = sep
+        row._app_id = app.get("id")
 
         # 悬停高亮
-        widgets = [row, inner, text, name_row, path_lbl, actions]
+        widgets = [row, inner, grip, text, name_row, path_lbl, actions]
 
         def on_enter(_e, ws=widgets):
+            if self._drag_row is not None:
+                return          # 拖拽中不抢被拖动行的高亮
             for w in ws:
                 try:
                     w.configure(bg=T.CARD_ALT)
@@ -421,6 +453,8 @@ class MainWindow:
             _recolor(row, T.CARD_ALT)
 
         def on_leave(_e, ws=widgets):
+            if self._drag_row is not None:
+                return
             for w in ws:
                 try:
                     w.configure(bg=T.CARD)
@@ -435,6 +469,122 @@ class MainWindow:
             w.bind("<Double-Button-1>", lambda _e=None, a=app: self.row_double_click(a))
             w.bind("<Button-3>", lambda e, a=app: self._show_row_menu(e, a))
         return row
+
+    # ------------------------------------------------------- 拖拽排序
+    def _make_grip(self, parent):
+        """行首拖拽手柄：两列三行小圆点（不依赖字体里是否有 ⠿ 这类字符）。"""
+        w, h = T.px(9), T.px(18)
+        c = tk.Canvas(parent, width=w, height=h, bg=T.CARD, highlightthickness=0,
+                      bd=0, cursor="fleur", takefocus=0)
+        r = max(1, int(round(T.px(1.2))))
+        for cx in (0.28, 0.72):
+            for cy in (0.2, 0.5, 0.8):
+                c.create_oval(w * cx - r, h * cy - r, w * cx + r, h * cy + r,
+                              fill=T.MUTED, outline=T.MUTED)
+        return c
+
+    def _drag_start(self, _event, app, row):
+        if self._drag_row is not None or len(self._row_widgets) < 2:
+            return
+        self._drag_row = row
+        self._drag_app = app
+        self._drag_moved = False
+        try:
+            _recolor(row, T.PRIMARY_SOFT)   # 被拖动行淡蓝底，明确「正在搬这一行」
+        except Exception:
+            pass
+
+    def _drag_motion(self, event=None):
+        """拖动中直接换位：只调整 pack 顺序，不重建控件。
+
+        B1-Motion 由隐式抓取送给按下时的那个手柄，所以行被移动后事件仍然
+        连续进来；一旦重建列表（refresh）抓取就会丢失，故 refresh 在拖拽期间
+        只能延后。
+        """
+        row = self._drag_row
+        if row is None or event is None:
+            return
+        try:
+            if not row.winfo_exists():
+                return
+            y = event.y_root - self.scroll.body.winfo_rooty()
+        except Exception:
+            return
+        rows = self._row_widgets
+        if row not in rows:
+            return
+
+        target = len(rows) - 1
+        for i, r in enumerate(rows):
+            try:
+                if y < r.winfo_y() + r.winfo_height() // 2:
+                    target = i
+                    break
+            except Exception:
+                continue
+        cur = rows.index(row)
+        if target == cur:
+            return
+        try:
+            if target > cur:
+                row.pack_configure(after=rows[target])
+            else:
+                row.pack_configure(before=rows[target])
+        except Exception:
+            return
+        rows.remove(row)
+        rows.insert(target, row)
+        self._drag_moved = True
+        self._sync_separators()
+        try:
+            self.scroll.canvas.configure(scrollregion=self.scroll.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _sync_separators(self):
+        """按当前视觉顺序重排分隔线：最后一行不带分隔线，其余都带。"""
+        rows = self._row_widgets
+        total = len(rows)
+        for i, r in enumerate(rows):
+            sep = getattr(r, "_sep", None)
+            if sep is None:
+                continue
+            try:
+                if i < total - 1:
+                    sep.pack(fill="x", padx=T.px(18))
+                else:
+                    sep.pack_forget()
+            except Exception:
+                pass
+
+    def _drag_end(self, _event=None):
+        row, app = self._drag_row, self._drag_app
+        self._drag_row = None
+        self._drag_app = None
+        if row is None:
+            return
+        moved, self._drag_moved = self._drag_moved, False
+        try:
+            if row.winfo_exists():
+                _recolor(row, T.CARD)
+        except Exception:
+            pass
+        if moved:
+            ids = [getattr(r, "_app_id", "") for r in self._row_widgets]
+            try:
+                ok = self.store.reorder_apps(ids)
+            except Exception:
+                ok = False
+            if not ok:
+                self.toast("顺序未能保存，已恢复原顺序", kind="warn")
+                self.refresh()
+                return
+            config_store.log(f"已调整应用顺序: {(app or {}).get('name', '')}")
+            self.push_event_text("已调整应用顺序")
+            self.toast("顺序已保存", kind="success")
+        if self._refresh_after_drag:
+            self._refresh_after_drag = False
+            self.refresh()
 
     def _show_row_menu(self, event, app: dict):
         menu = tk.Menu(self.root, tearoff=0, bg=T.CARD, fg=T.TEXT,
